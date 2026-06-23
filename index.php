@@ -2,6 +2,10 @@
 date_default_timezone_set('Asia/Jakarta'); // Forces system timeline to UTC+7 execution space
 define('DB_DIR', __DIR__ . '/wikidata_local_db');
 define('SUPERUSER_ID', 'SET UP YOURS!!');
+$app_key = 'your-super-secret-app-wide-key!'; // Change this in production
+$cipher = 'AES-256-CBC';
+$iv = substr(hash('sha256', 'static-iv-for-single-file-prototype'), 0, 16);
+
 
 if (!file_exists(DB_DIR)) {
     mkdir(DB_DIR, 0755, true);
@@ -10,7 +14,7 @@ if (!file_exists(DB_DIR)) {
 
 if (!isset($_COOKIE['wiki_user_id'])) {
     $visitorId = 'u_' . bin2hex(random_bytes(8));
-    setcookie('wiki_user_id', $visitorId, time() + (86400 * 365), "/");
+    setcookie('wiki_user_id', $visitorId, time() + (86400 * 365 * 25), "/");
     $_COOKIE['wiki_user_id'] = $visitorId;
 }
 $currentUserId = $_COOKIE['wiki_user_id'];
@@ -63,6 +67,9 @@ if (!isset($users[$currentUserId])) {
     $users[$currentUserId]['ua'] = $currentUserUA;
 }
 db_save_json('users.json', $users);
+
+
+
 
 if (!isset($users[SUPERUSER_ID])) {
     $users[SUPERUSER_ID] = ['id' => SUPERUSER_ID, 'ip' => '127.0.0.1', 'ua' => 'System Engine', 'banned' => false, 'ban_until' => 0, 'lists' => [], 'messages' => []];
@@ -659,10 +666,10 @@ function render_value($val) {
         if (!$item): echo "<div class='alert'>Knowledge block entity Q$viewId does not exist inside current file frames.</div>";
         else: ?>
             <div style="background:#f1f2f3; padding:4px; margin-bottom:4px; border:1px solid #d1d5da; display:flex; justify-content:space-between; align-items:center;">
-                <form action="?route=edit_item_label" method="POST" style="display:flex; align-items:center; gap:4px; margin:0; flex:1;">
+                <form action="?route=edit_item_label" method="POST" style="display:flex; align-items:center; gap:4px; margin:0; flex:1; flex-wrap:wrap">
                     <input type="hidden" name="item_id" value="<?= $viewId ?>">
                     <strong>Entity Q<?= $viewId ?> Node Identity: </strong>
-                    <input type="text" name="new_label" value="<?= htmlspecialchars($item['label']) ?>" style="margin:0; flex:1; font-weight:bold;">
+                    <input type="text" name="new_label" value="<?= htmlspecialchars($item['label']) ?>" style="margin:0; flex:1; font-weight:bold;field-sizing:content;">
                     <input type="submit" value="Apply Identity Correction" <?= $isBanned ? 'disabled' : '' ?>>
                     <button type="button" style="margin-left:4px; background:#6a737d;" onclick="toggleMatrixColumns()">modify order-action matrix</button>
                 </form>
@@ -768,7 +775,10 @@ function render_value($val) {
                         $uId = $parts[0]; $lName = $parts[1];
                         if (isset($users[$uId]['lists'][$lName]) && in_array($viewId, $users[$uId]['lists'][$lName]['items'])) {
                             $displayRefUser = ($uId === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($uId);
-                            echo "<p style='margin:2px;'>📁 Public Compilation Title: <a href='?route=view_list&user_id=" . urlencode($uId) . "&list_name=" . urlencode($lName) . "'><strong>" . htmlspecialchars($lName) . "</strong></a> curated by node user tracking string <em>" . $displayRefUser . "</em></p>";
+
+                            $encrypted_uuid = openssl_encrypt($uId, $cipher, $app_key, 0, $iv);
+
+                            echo "<p style='margin:2px;'>📁 Public Compilation Title: <a href='?route=view_list&user_id=" . urlencode($encrypted_uuid) . "&list_name=" . urlencode($lName) . "'><strong>" . htmlspecialchars($lName) . "</strong></a> curated by node user tracking string <em>" . $encrypted_uuid . "</em></p>";
                             $foundList = true;
                         }
                     }
@@ -781,14 +791,14 @@ function render_value($val) {
     <?php
     // ROUTE: PUBLIC LIST COMPILATION VIEWER
     elseif ($viewRoute === 'view_list'):
-        $tgtUser = $_GET['user_id'] ?? '';
+        $tgtUser = openssl_decrypt($_GET['user_id'], $cipher, $app_key, 0, $iv) ?? '';
         $tgtListName = $_GET['list_name'] ?? '';
         $targetList = $users[$tgtUser]['lists'][$tgtListName] ?? null;
         if (!$targetList): echo "<div class='alert'>The specified user data compilation list was modified or pulled from access availability.</div>";
         else: 
-            $displayTgtUser = ($tgtUser === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($tgtUser);
+            $displayTgtUser = ($tgtUser === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($_GET['user_id']);
         ?>
-            <h2>Curated Public Graph Set Index: <?= htmlspecialchars($tgtListName) ?> [Published by Node Node: <?= $displayTgtUser ?>]</h2>
+            <h2>Curated Public Graph Set Index: <?= htmlspecialchars($tgtListName) ?> [Published by Node: <?= $displayTgtUser ?>]</h2>
             <table>
                 <tr><th>Assigned Node Identity</th><th>Curator Annotation Log Explanations</th></tr>
                 <?php if (empty($targetList['items'])): ?>
@@ -818,7 +828,7 @@ function render_value($val) {
         <h2>Open Matrix Discussion Logs</h2>
         <?php if (empty($forum)): echo "<p style='color:#aaa;'>No system coordination channels initialized.</p>";
         else: foreach (array_reverse($forum) as $tId => $thread): 
-            $displayThreadAuthor = ($thread['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($thread['user_id']);
+            $displayThreadAuthor = ($thread['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars(openssl_encrypt($thread['user_id'], $cipher, $app_key, 0, $iv));
         ?>
             <div class="forum-card">
                 <div style="display:flex; justify-content:between; align-items:center;">
@@ -844,7 +854,7 @@ function render_value($val) {
         $thread = $forum[$tId] ?? null;
         if (!$thread): echo "<div class='alert'>Discussion system coordinate reference is missing.</div>";
         else: 
-            $displayMainAuthor = ($thread['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($thread['user_id']);
+            $displayMainAuthor = ($thread['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars(openssl_encrypt($thread['user_id'], $cipher, $app_key, 0, $iv));
         ?>
             <h2>Thread Scope Channel: <?= htmlspecialchars($thread['title']) ?></h2>
             <div style="background:#fafbfc; border:1px solid #d1d5da; padding:6px; margin-bottom:6px; position:relative;">
@@ -865,7 +875,7 @@ function render_value($val) {
             <div style="padding-left:12px; border-left:2px solid #ddd; margin-bottom:6px;">
                 <?php if (empty($thread['replies'])): echo "<p style='color:#aaa;'>No relational comments appended onto this record thread.</p>";
                 else: foreach ($thread['replies'] as $rep): 
-                    $displayReplyAuthor = ($rep['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($rep['user_id']);
+                    $displayReplyAuthor = ($rep['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars(openssl_encrypt($rep['user_id'], $cipher, $app_key, 0, $iv));
                 ?>
                     <div style="background:#fff; border:1px solid #e1e4e8; padding:4px; margin-bottom:4px; position:relative;">
                         <strong><?= $displayReplyAuthor ?></strong> 
