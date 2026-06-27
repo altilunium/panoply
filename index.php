@@ -687,7 +687,7 @@ function render_value($val) {
             <table id="statements-matrix-table">
                 <thead>
                     <tr>
-                        <th style="width:1%; white-space:nowrap;">Declared Semantic Link Property</th>
+                        <th style="width:1%; overflow-wrap: anywhere;">Declared Semantic Link Property</th>
                         <th>Parsed Value Definition Claims</th>
                         <th class="matrix-col" style="width: 40px; text-align: center;">Order</th>
                         <th class="matrix-col">Action Matrix</th>
