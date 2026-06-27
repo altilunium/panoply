@@ -1,11 +1,10 @@
 <?php
 date_default_timezone_set('Asia/Jakarta'); // Forces system timeline to UTC+7 execution space
 define('DB_DIR', __DIR__ . '/wikidata_local_db');
-define('SUPERUSER_ID', 'SET UP YOURS!!');
+define('SUPERUSER_ID', 'SET UP YOURS!');
 $app_key = 'your-super-secret-app-wide-key!'; // Change this in production
 $cipher = 'AES-256-CBC';
 $iv = substr(hash('sha256', 'static-iv-for-single-file-prototype'), 0, 16);
-
 
 if (!file_exists(DB_DIR)) {
     mkdir(DB_DIR, 0755, true);
@@ -67,9 +66,6 @@ if (!isset($users[$currentUserId])) {
     $users[$currentUserId]['ua'] = $currentUserUA;
 }
 db_save_json('users.json', $users);
-
-
-
 
 if (!isset($users[SUPERUSER_ID])) {
     $users[SUPERUSER_ID] = ['id' => SUPERUSER_ID, 'ip' => '127.0.0.1', 'ua' => 'System Engine', 'banned' => false, 'ban_until' => 0, 'lists' => [], 'messages' => []];
@@ -191,6 +187,26 @@ if (isset($_GET['api'])) {
 $msg = "";
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
     $route = $_GET['route'] ?? '';
+
+    // NEW DRAG AND DROP BULK REORDER ROUTE
+    if ($route === 'reorder_statements_bulk') {
+        $itemId = $_POST['item_id'] ?? '';
+        $newOrder = explode(',', $_POST['new_order'] ?? '');
+        $item = db_get_item($itemId);
+        
+        if ($item && !empty($newOrder)) {
+            $newStatements = [];
+            foreach ($newOrder as $oldIdx) {
+                if ($oldIdx !== '' && isset($item['statements'][$oldIdx])) {
+                    $newStatements[] = $item['statements'][$oldIdx];
+                }
+            }
+            $item['statements'] = $newStatements;
+            db_save_item($itemId, $item);
+            header("Location: ?id=" . $itemId . "&show_matrix=1");
+            exit;
+        }
+    }
 
     if ($route === 'add_item') {
         $label = trim($_POST['label'] ?? '');
@@ -314,24 +330,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
             log_activity($currentUserId, 'add_statement', "Added claim to Q$itemId: $propStringName ($pId) -> $resolvedValueDetails");
             
             header("Location: ?id=" . $itemId);
-            exit;
-        }
-    }
-
-    if ($route === 'rearrange_statement') {
-        $itemId = $_POST['item_id'] ?? '';
-        $indexPos = intval($_POST['index'] ?? -1);
-        $direction = $_POST['dir'] ?? '';
-        $item = db_get_item($itemId);
-        if ($item && $indexPos >= 0 && isset($item['statements'][$indexPos])) {
-            $targetPos = ($direction === 'up') ? $indexPos - 1 : $indexPos + 1;
-            if ($targetPos >= 0 && $targetPos < count($item['statements'])) {
-                $tmp = $item['statements'][$indexPos];
-                $item['statements'][$indexPos] = $item['statements'][$targetPos];
-                $item['statements'][$targetPos] = $tmp;
-                db_save_item($itemId, $item);
-            }
-            header("Location: ?id=" . $itemId . "&show_matrix=1");
             exit;
         }
     }
@@ -544,7 +542,7 @@ function render_value($val) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-     <link rel="icon" href="https://pbs.twimg.com/profile_images/1716831335724326912/8ujZJHcJ_400x400.jpg" type="image/x-icon" />
+    <link rel="icon" href="https://pbs.twimg.com/profile_images/1716831335724326912/8ujZJHcJ_400x400.jpg" type="image/x-icon" />
     <title>Altilunium Panoply v26.6.22</title>
     <style>
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -681,36 +679,62 @@ function render_value($val) {
                 <?php endif; ?>
             </div>
 
+            <form id="reorder-form" action="?route=reorder_statements_bulk" method="POST" style="display:none;">
+                <input type="hidden" name="item_id" value="<?= $viewId ?>">
+                <input type="hidden" name="new_order" id="new_order_input">
+            </form>
+
             <table id="statements-matrix-table">
                 <thead>
-                    <tr><th>Declared Semantic Link Property</th><th>Parsed Value Definition Claims</th><th class="matrix-col">Order Matrix</th><th class="matrix-col">Action Matrix</th></tr>
-                </thead>
-                <tbody>
-                <?php if (empty($item['statements'])): ?>
-                    <tr><td colspan="4" style="color:#aaa; text-align:center;">No relational matrix links map out from this entity block.</td></tr>
-                <?php else: foreach ($item['statements'] as $idx => $stmt):
-                    $propLabel = $index['properties'][$stmt['p_id']]['label'] ?? $stmt['p_id'];
-                    if (!empty($index['properties'][$stmt['p_id']]['deleted'])) continue;
-                ?>
                     <tr>
-                        <td><strong><?= htmlspecialchars($propLabel) ?></strong> <span class="badge"><?= htmlspecialchars($stmt['p_id']) ?></span></td>
-                        <td><?= render_value($stmt['value']) ?></td>
-                        <td class="matrix-col">
-                            <form action="?route=rearrange_statement" method="POST" style="display:inline;">
-                                <input type="hidden" name="item_id" value="<?= $viewId ?>"><input type="hidden" name="index" value="<?= $idx ?>">
-                                <button type="submit" name="dir" value="up" <?= $isBanned ? 'disabled' : '' ?>>▲</button>
-                                <button type="submit" name="dir" value="down" <?= $isBanned ? 'disabled' : '' ?>>▼</button>
-                            </form>
+                        <th style="width:1%; white-space:nowrap;">Declared Semantic Link Property</th>
+                        <th>Parsed Value Definition Claims</th>
+                        <th class="matrix-col" style="width: 40px; text-align: center;">Order</th>
+                        <th class="matrix-col">Action Matrix</th>
+                    </tr>
+                </thead>
+                <?php if (empty($item['statements'])): ?>
+                <tbody>
+                    <tr><td colspan="4" style="color:#aaa; text-align:center;">No relational matrix links map out from this entity block.</td></tr>
+                </tbody>
+                <?php else: 
+                    // Group statements by Property ID to support merged cells (rowspan)
+                    $groupedStatements = [];
+                    foreach ($item['statements'] as $idx => $stmt) {
+                        $groupedStatements[$stmt['p_id']][] = ['idx' => $idx, 'stmt' => $stmt];
+                    }
+
+                    foreach ($groupedStatements as $pId => $stmts):
+                        if (!empty($index['properties'][$pId]['deleted'])) continue;
+                        $propLabel = $index['properties'][$pId]['label'] ?? $pId;
+                        $rowspan = count($stmts);
+                ?>
+                <tbody class="property-group">
+                    <?php foreach ($stmts as $i => $s): $idx = $s['idx']; $stmt = $s['stmt']; ?>
+                    <tr class="draggable-row" draggable="true" data-idx="<?= $idx ?>">
+                        <?php if ($i === 0): ?>
+                        <td rowspan="<?= $rowspan ?>" style="background: #fff; vertical-align: middle;">
+                            <strong><?= htmlspecialchars($propLabel) ?></strong> <span class="badge"><?= htmlspecialchars($pId) ?></span>
                         </td>
+                        <?php endif; ?>
+                        
+                        <td style="background: #fff;"><?= render_value($stmt['value']) ?></td>
+                        
+                        <td class="matrix-col" style="text-align:center; cursor:grab; font-size:16px; color:#aaa; user-select: none;" title="Drag to reorder">
+                            ☰
+                        </td>
+                        
                         <td class="matrix-col">
                             <form action="?route=delete_statement" method="POST" style="display:inline;">
-                                <input type="hidden" name="item_id" value="<?= $viewId ?>"><input type="hidden" name="index" value="<?= $idx ?>">
+                                <input type="hidden" name="item_id" value="<?= $viewId ?>">
+                                <input type="hidden" name="index" value="<?= $idx ?>">
                                 <input type="submit" class="action-btn" value="[Delete Assignment]" <?= $isBanned ? 'disabled' : '' ?> onclick="return confirm('Log statement extraction?');">
                             </form>
                         </td>
                     </tr>
-                <?php endforeach; endif; ?>
+                    <?php endforeach; ?>
                 </tbody>
+                <?php endforeach; endif; ?>
             </table>
 
             <div class="col" style="margin-top:4px;">
@@ -1230,6 +1254,82 @@ document.addEventListener("DOMContentLoaded", function() {
         document.addEventListener('click', function(clickEvent) {
             if (!inputField.contains(clickEvent.target) && !dropBox.contains(clickEvent.target)) {
                 dropBox.style.display = 'none';
+            }
+        });
+    });
+
+    // Drag and Drop Reordering Subsystem
+    let draggedRow = null;
+
+    document.querySelectorAll('.draggable-row').forEach(row => {
+        row.addEventListener('dragstart', function(e) {
+            draggedRow = this;
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', this.getAttribute('data-idx')); // Required for Firefox
+            setTimeout(() => { 
+                this.style.background = '#e1e4e8'; 
+                this.style.opacity = '0.6'; 
+            }, 0);
+        });
+
+        row.addEventListener('dragend', function() {
+            this.style.background = '';
+            this.style.opacity = '1';
+            draggedRow = null;
+            document.querySelectorAll('.draggable-row').forEach(r => {
+                r.style.borderTop = '';
+                r.style.borderBottom = '';
+            });
+        });
+
+        row.addEventListener('dragover', function(e) {
+            e.preventDefault(); // Necessary to allow dropping
+            if (this !== draggedRow) {
+                let rect = this.getBoundingClientRect();
+                let relY = e.clientY - rect.top;
+                // Give visual feedback based on upper/lower half of the hovered row
+                if (relY < rect.height / 2) {
+                    this.style.borderTop = '2px solid #0366d6';
+                    this.style.borderBottom = '';
+                } else {
+                    this.style.borderBottom = '2px solid #0366d6';
+                    this.style.borderTop = '';
+                }
+            }
+        });
+
+        row.addEventListener('dragleave', function() {
+            this.style.borderTop = '';
+            this.style.borderBottom = '';
+        });
+
+        row.addEventListener('drop', function(e) {
+            e.preventDefault();
+            this.style.borderTop = '';
+            this.style.borderBottom = '';
+            
+            if (this !== draggedRow) {
+                let allRows = Array.from(document.querySelectorAll('.draggable-row'));
+                let draggedIdx = allRows.indexOf(draggedRow);
+                let targetIdx = allRows.indexOf(this);
+                
+                let rect = this.getBoundingClientRect();
+                let relY = e.clientY - rect.top;
+                
+                // Adjust target index if dropping on the bottom half
+                if (relY >= rect.height / 2) {
+                    targetIdx++;
+                }
+                
+                // Array mutation to build the new structural order
+                allRows.splice(draggedIdx, 1);
+                if (targetIdx > draggedIdx) targetIdx--; 
+                allRows.splice(targetIdx, 0, draggedRow);
+                
+                // Extract original flat array indices in their new order
+                let newOrder = allRows.map(r => r.getAttribute('data-idx'));
+                document.getElementById('new_order_input').value = newOrder.join(',');
+                document.getElementById('reorder-form').submit();
             }
         });
     });
