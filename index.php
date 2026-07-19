@@ -1,8 +1,8 @@
 <?php
-date_default_timezone_set('Asia/Jakarta'); // Forces system timeline to UTC+7 execution space
+date_default_timezone_set('Asia/Jakarta');
 define('DB_DIR', __DIR__ . '/wikidata_local_db');
-define('SUPERUSER_ID', 'SET UP YOURS!');
-$app_key = 'your-super-secret-app-wide-key!'; // Change this in production
+define('SUPERUSER_ID', 'SET UP YOURS');
+$app_key = 'your-super-secret-app-wide-key!'; 
 $cipher = 'AES-256-CBC';
 $iv = substr(hash('sha256', 'static-iv-for-single-file-prototype'), 0, 16);
 
@@ -46,10 +46,15 @@ function db_save_item($itemId, $itemData) {
     db_save_json($filename, $chunk);
 }
 
-$index = db_load_json('index.json', ['next_item_id' => 1, 'labels' => [], 'registry' => [], 'properties' => [], 'backlinks' => [], 'lists' => []]);
+$index = db_load_json('index.json', ['next_item_id' => 1, 'labels' => [], 'registry' => [], 'properties' => [], 'backlinks' => [], 'lists' => [], 'wd_shadows' => []]);
 $users = db_load_json('users.json', []);
 $forum = db_load_json('forum_threads.json', []);
 $logs  = db_load_json('logs.json', []);
+
+if (!isset($index['wd_shadows'])) {
+    $index['wd_shadows'] = [];
+    db_save_json('index.json', $index);
+}
 
 if (!isset($index['registry'])) {
     $index['registry'] = [];
@@ -86,7 +91,6 @@ function log_activity($userId, $action, $detail) {
     db_save_json('logs.json', $logs);
 }
 
-// ASYNCHRONOUS DATA PIPELINE AND AUTOCOMPLETE ROUTER
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
     $apiAction = $_GET['api'];
@@ -183,12 +187,10 @@ if (isset($_GET['api'])) {
     }
 }
 
-// POST REQUEST TRANSACTION MANAGEMENT
 $msg = "";
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
     $route = $_GET['route'] ?? '';
 
-    // NEW DRAG AND DROP BULK REORDER ROUTE
     if ($route === 'reorder_statements_bulk') {
         $itemId = $_POST['item_id'] ?? '';
         $newOrder = explode(',', $_POST['new_order'] ?? '');
@@ -302,7 +304,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
         } elseif ($mode === 'link_wikidata' && !empty($_POST['wikidata_id'])) {
             $wdId = trim($_POST['wikidata_id']);
             $wdLabel = trim($_POST['wikidata_label'] ?? '');
-            $val = ';' . $wdId . ($wdLabel !== '' ? '|' . $wdLabel : '');
+            
+            if (!isset($index['wd_shadows'][$wdId])) {
+                $newId = $index['next_item_id']++;
+                $index['wd_shadows'][$wdId] = $newId;
+                
+                $shadowLabel = $wdLabel;
+                if (isset($index['labels'][strtolower($shadowLabel)])) {
+                    $shadowLabel .= " ($wdId)";
+                }
+                $index['labels'][strtolower($shadowLabel)] = $newId;
+                $index['registry'][$newId] = ['label' => $shadowLabel, 'timestamp' => time()];
+                db_save_item($newId, ['label' => $shadowLabel, 'statements' => [], 'wd_id' => $wdId]);
+                db_save_json('index.json', $index);
+                log_activity($currentUserId, 'create_shadow_node', "Generated shadow link Q$newId mapping to $wdId");
+            }
+            
+            $val = ':' . $index['wd_shadows'][$wdId];
         }
         
         $item = db_get_item($itemId);
@@ -350,65 +368,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
 
     if ($route === 'manage_lists') {
         $sub = $_POST['sub_action'] ?? '';
+        $listName = trim($_POST['list_name'] ?? '');
+        $targetUserRaw = $_POST['target_user'] ?? '';
+        
+        $ownerId = $currentUserId;
+        if ($targetUserRaw !== '') {
+            $decryptedOwner = openssl_decrypt($targetUserRaw, $cipher, $app_key, 0, $iv);
+            if ($decryptedOwner && isset($users[$decryptedOwner])) {
+                $ownerId = $decryptedOwner;
+            }
+        }
+        
+        $canEdit = false;
+        if ($ownerId === $currentUserId) {
+            $canEdit = true;
+        } elseif (isset($users[$ownerId]['lists'][$listName]) && !empty($users[$ownerId]['lists'][$listName]['is_public'])) {
+            $canEdit = true;
+        }
+        
         if ($sub === 'create') {
-            $listName = trim($_POST['list_name'] ?? '');
             if ($listName !== '') {
-                $users[$currentUserId]['lists'][$listName] = ['items' => [], 'comments' => []];
+                $isPublic = ($_POST['visibility'] ?? 'private') === 'public';
+                $users[$currentUserId]['lists'][$listName] = ['items' => [], 'comments' => [], 'is_public' => $isPublic];
                 db_save_json('users.json', $users);
             }
-        } elseif ($sub === 'delete') {
-            $listName = $_POST['list_name'] ?? '';
-            unset($users[$currentUserId]['lists'][$listName]);
+        } elseif ($sub === 'delete' && $canEdit) {
+            unset($users[$ownerId]['lists'][$listName]);
             db_save_json('users.json', $users);
-        } elseif ($sub === 'rename') {
+        } elseif ($sub === 'rename' && $canEdit) {
             $oldName = $_POST['old_name'] ?? '';
             $newName = trim($_POST['new_name'] ?? '');
-            if ($newName !== '' && isset($users[$currentUserId]['lists'][$oldName])) {
-                $users[$currentUserId]['lists'][$newName] = $users[$currentUserId]['lists'][$oldName];
-                unset($users[$currentUserId]['lists'][$oldName]);
+            if ($newName !== '' && isset($users[$ownerId]['lists'][$oldName])) {
+                $users[$ownerId]['lists'][$newName] = $users[$ownerId]['lists'][$oldName];
+                unset($users[$ownerId]['lists'][$oldName]);
                 db_save_json('users.json', $users);
             }
-        } elseif ($sub === 'add_item_to_list') {
-            $listName = $_POST['list_name'] ?? '';
+        } elseif ($sub === 'add_item_to_list' && $canEdit) {
             $itId = $_POST['internal_item_id'] ?? '';
-            if ($itId && isset($users[$currentUserId]['lists'][$listName])) {
-                if (!in_array($itId, $users[$currentUserId]['lists'][$listName]['items'])) {
-                    $users[$currentUserId]['lists'][$listName]['items'][] = $itId;
-                    $index['lists'][$itId][] = $currentUserId . '||' . $listName;
+            if ($itId && isset($users[$ownerId]['lists'][$listName])) {
+                if (!in_array($itId, $users[$ownerId]['lists'][$listName]['items'])) {
+                    $users[$ownerId]['lists'][$listName]['items'][] = $itId;
+                    $index['lists'][$itId][] = $ownerId . '||' . $listName;
                     $index['lists'][$itId] = array_unique($index['lists'][$itId]);
                     db_save_json('index.json', $index);
                 }
-                $users[$currentUserId]['lists'][$listName]['comments'][$itId] = trim($_POST['comment'] ?? '');
+                $users[$ownerId]['lists'][$listName]['comments'][$itId] = trim($_POST['comment'] ?? '');
                 db_save_json('users.json', $users);
             }
-            header("Location: ?route=profile");
-            exit;
-        } elseif ($sub === 'update_comment') {
-            $listName = $_POST['list_name'] ?? '';
+        } elseif ($sub === 'update_comment' && $canEdit) {
             $itId = $_POST['item_id'] ?? '';
-            if (isset($users[$currentUserId]['lists'][$listName])) {
-                $users[$currentUserId]['lists'][$listName]['comments'][$itId] = trim($_POST['comment'] ?? '');
+            if (isset($users[$ownerId]['lists'][$listName])) {
+                $users[$ownerId]['lists'][$listName]['comments'][$itId] = trim($_POST['comment'] ?? '');
                 db_save_json('users.json', $users);
             }
-            header("Location: ?route=profile");
-            exit;
-        } elseif ($sub === 'remove_item') {
-            $listName = $_POST['list_name'] ?? '';
+        } elseif ($sub === 'remove_item' && $canEdit) {
             $itId = $_POST['item_id'] ?? '';
-            if (isset($users[$currentUserId]['lists'][$listName])) {
-                $idx = array_search($itId, $users[$currentUserId]['lists'][$listName]['items']);
+            if (isset($users[$ownerId]['lists'][$listName])) {
+                $idx = array_search($itId, $users[$ownerId]['lists'][$listName]['items']);
                 if ($idx !== false) {
-                    array_splice($users[$currentUserId]['lists'][$listName]['items'], $idx, 1);
-                    unset($users[$currentUserId]['lists'][$listName]['comments'][$itId]);
+                    array_splice($users[$ownerId]['lists'][$listName]['items'], $idx, 1);
+                    unset($users[$ownerId]['lists'][$listName]['comments'][$itId]);
                     db_save_json('users.json', $users);
                 }
             }
-        } elseif ($sub === 'rearrange_item') {
-            $listName = $_POST['list_name'] ?? '';
+        } elseif ($sub === 'rearrange_item' && $canEdit) {
             $itId = $_POST['item_id'] ?? '';
             $dir = $_POST['dir'] ?? '';
-            if (isset($users[$currentUserId]['lists'][$listName])) {
-                $arr = &$users[$currentUserId]['lists'][$listName]['items'];
+            if (isset($users[$ownerId]['lists'][$listName])) {
+                $arr = &$users[$ownerId]['lists'][$listName]['items'];
                 $idx = array_search($itId, $arr);
                 if ($idx !== false) {
                     $targ = ($dir === 'up') ? $idx - 1 : $idx + 1;
@@ -419,7 +446,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
                 }
             }
         }
-        header("Location: ?route=profile");
+        
+        if ($ownerId !== $currentUserId) {
+            header("Location: ?route=view_list&user_id=" . urlencode(openssl_encrypt($ownerId, $cipher, $app_key, 0, $iv)) . "&list_name=" . urlencode($listName));
+        } else {
+            header("Location: ?route=profile");
+        }
         exit;
     }
 
@@ -529,7 +561,7 @@ function render_value($val) {
         $parts = explode('|', substr($val, 1));
         $wdId = $parts[0];
         $wdLabel = !empty($parts[1]) ? $parts[1] : $wdId;
-        return "<a href='https://www.wikidata.org/wiki/" . htmlspecialchars($wdId) . "' target='_blank'><strong>" . htmlspecialchars($wdLabel) . "</strong> (" . htmlspecialchars($wdId) . ") [Wikidata] ↗</a>";
+        return "<a href='https://wdlite.toolforge.org/?item=" . htmlspecialchars($wdId) . "' target='_blank'><strong>" . htmlspecialchars($wdLabel) . "</strong> (" . htmlspecialchars($wdId) . ") [Wikidata] ↗</a>";
     }
     if (filter_var($val, FILTER_VALIDATE_URL)) {
         return "<a href='" . htmlspecialchars($val) . "' target='_blank'>" . htmlspecialchars($val) . " ↗</a>";
@@ -599,7 +631,6 @@ function render_value($val) {
     $viewRoute = $_GET['route'] ?? '';
     $viewId = $_GET['id'] ?? '';
 
-    // ROUTE: INDEX / HOMEPAGE STREAM WITH PAGINATION
     if ($viewRoute === '' && $viewId === ''): ?>
         <div class="grid">
             <div class="col">
@@ -612,6 +643,12 @@ function render_value($val) {
             </div>
             <div class="col">
                 <h2>Real-time Activity Stream Index</h2>
+                <form action="" method="GET" style="display:flex; gap:4px; margin-bottom:8px; position:relative;">
+                    <input type="text" class="autocomplete-trigger" data-type="item" placeholder="Search exact node identity ledger..." autocomplete="off">
+                    <input type="hidden" name="id" class="autocomplete-target">
+                    <input type="submit" value="Jump to Node">
+                    <div class="ac-dropdown" style="top:100%;"></div>
+                </form>
                 <div id="items-stream-container">
                     <table id="items-stream-table">
                         <thead><tr><th>Entity ID</th><th>Original Identifier Label Reference</th></tr></thead>
@@ -625,7 +662,6 @@ function render_value($val) {
         </div>
 
     <?php
-    // ROUTE: PROPERTY SYSTEM MANAGEMENT
     elseif ($viewRoute === 'properties'): ?>
         <div class="grid">
             <div class="col">
@@ -658,11 +694,18 @@ function render_value($val) {
         </div>
 
     <?php
-    // ROUTE: KNOWLEDGE NODE EDITING AND CLAIM INTERACTION
     elseif ($viewId !== ''):
         $item = db_get_item($viewId);
         if (!$item): echo "<div class='alert'>Knowledge block entity Q$viewId does not exist inside current file frames.</div>";
         else: ?>
+            
+            <?php if (!empty($item['wd_id'])): ?>
+                <div class="alert" style="background:#e2f0fd; border-color:#0366d6; color:#0366d6; margin-bottom:6px;">
+                    🌐 <strong>Shadow Entity Node Active.</strong> This internal graph entry represents a remote Wikidata entity.
+                    <a href="https://wdlite.toolforge.org/?item=<?= htmlspecialchars($item['wd_id']) ?>" target="_blank" style="font-weight:bold; margin-left:8px;">[Access External WDLite Context: <?= htmlspecialchars($item['wd_id']) ?> ↗]</a>
+                </div>
+            <?php endif; ?>
+
             <div style="background:#f1f2f3; padding:4px; margin-bottom:4px; border:1px solid #d1d5da; display:flex; justify-content:space-between; align-items:center;">
                 <form action="?route=edit_item_label" method="POST" style="display:flex; align-items:center; gap:4px; margin:0; flex:1; flex-wrap:wrap">
                     <input type="hidden" name="item_id" value="<?= $viewId ?>">
@@ -698,7 +741,6 @@ function render_value($val) {
                     <tr><td colspan="4" style="color:#aaa; text-align:center;">No relational matrix links map out from this entity block.</td></tr>
                 </tbody>
                 <?php else: 
-                    // Group statements by Property ID to support merged cells (rowspan)
                     $groupedStatements = [];
                     foreach ($item['statements'] as $idx => $stmt) {
                         $groupedStatements[$stmt['p_id']][] = ['idx' => $idx, 'stmt' => $stmt];
@@ -737,45 +779,6 @@ function render_value($val) {
                 <?php endforeach; endif; ?>
             </table>
 
-            <div class="col" style="margin-top:4px;">
-                <h2>Append Structural Relational Statement</h2>
-                <form action="?route=add_statement" method="POST" style="display:flex; flex-direction:column; gap:2px;">
-                    <input type="hidden" name="item_id" value="<?= $viewId ?>">
-                    
-                    <div style="position:relative;">
-                        <label>Target Schema Property Element (Type to Search Autocomplete Suggestions):</label>
-                        <input type="text" class="autocomplete-trigger" data-type="prop" placeholder="Search system configuration properties map..." required autocomplete="off">
-                        <input type="hidden" name="property_id" class="autocomplete-target">
-                        <div class="ac-dropdown"></div>
-                    </div>
-
-                    <div style="margin:4px 0; border:1px dashed #ccc; padding:4px; background:#fff;">
-                        <label><input type="radio" name="value_mode" value="text" checked onchange="toggleValueInputs(this)"> Free String / Remote Web URL Data Payload</label>
-                        <label style="margin-left:8px;"><input type="radio" name="value_mode" value="link_internal" onchange="toggleValueInputs(this)"> Link Node To Internal Database Entity</label>
-                        <label style="margin-left:8px;"><input type="radio" name="value_mode" value="link_wikidata" onchange="toggleValueInputs(this)"> Link Node To Wikidata Items</label>
-                    </div>
-
-                    <div id="wrapper-value-text">
-                        <input type="text" name="value" placeholder="Enter alphanumeric text statement or external hyperlink structure...">
-                    </div>
-
-                    <div id="wrapper-value-link" style="display:none; position:relative;">
-                        <input type="text" class="autocomplete-trigger" data-type="item" placeholder="Search item nodes database by name mapping..." autocomplete="off">
-                        <input type="hidden" name="internal_item_id" class="autocomplete-target">
-                        <div class="ac-dropdown"></div>
-                    </div>
-
-                    <div id="wrapper-value-wikidata" style="display:none; position:relative;">
-                        <input type="text" class="autocomplete-trigger" data-type="wikidata" placeholder="Type to search live remote Wikidata entities (e.g., Douglas Adams)..." autocomplete="off">
-                        <input type="hidden" name="wikidata_id" class="autocomplete-target">
-                        <input type="hidden" name="wikidata_label" class="autocomplete-extra-target">
-                        <div class="ac-dropdown"></div>
-                    </div>
-
-                    <input type="submit" value="Commit Statement Framework" style="margin-top:4px;" <?= $isBanned ? 'disabled' : '' ?>>
-                </form>
-            </div>
-
             <div class="footer-section">
                 <h2>Inverse Node Entry Trace Mapping (Backlinks Index)</h2>
                 <?php
@@ -798,22 +801,65 @@ function render_value($val) {
                     if (count($parts) === 2) {
                         $uId = $parts[0]; $lName = $parts[1];
                         if (isset($users[$uId]['lists'][$lName]) && in_array($viewId, $users[$uId]['lists'][$lName]['items'])) {
-                            $displayRefUser = ($uId === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($uId);
-
-                            $encrypted_uuid = openssl_encrypt($uId, $cipher, $app_key, 0, $iv);
-
-                            echo "<p style='margin:2px;'>📁 Public Compilation Title: <a href='?route=view_list&user_id=" . urlencode($encrypted_uuid) . "&list_name=" . urlencode($lName) . "'><strong>" . htmlspecialchars($lName) . "</strong></a> curated by node user tracking string <em>" . $encrypted_uuid . "</em></p>";
-                            $foundList = true;
+                            $isPub = !empty($users[$uId]['lists'][$lName]['is_public']);
+                            if ($isPub || $uId === $currentUserId) {
+                                $displayRefUser = ($uId === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($uId);
+                                $encrypted_uuid = openssl_encrypt($uId, $cipher, $app_key, 0, $iv);
+                                $pubMarker = $isPub ? "[🔓 Public Interface]" : "[🔒 Private File]";
+                                echo "<p style='margin:2px;'>📁 Compilation Title: <a href='?route=view_list&user_id=" . urlencode($encrypted_uuid) . "&list_name=" . urlencode($lName) . "'><strong>" . htmlspecialchars($lName) . "</strong></a> $pubMarker curated by node user tracking string <em>" . $encrypted_uuid . "</em></p>";
+                                $foundList = true;
+                            }
                         }
                     }
                 }
-                if (!$foundList) echo "<p style='color:#666; margin:2px;'>This element sits inside no compiled personal index frames.</p>";
+                if (!$foundList) echo "<p style='color:#666; margin:2px;'>This element sits inside no compiled or visible personal index frames.</p>";
                 ?>
             </div>
+            
+            <div class="col" style="margin-top:12px; background:#fafbfc; border-top:2px solid #ccc;">
+                <details>
+                    <summary style="cursor:pointer; font-weight:bold; font-size:12px; padding:4px;">[+] Append Structural Relational Statement Protocol</summary>
+                    <form action="?route=add_statement" method="POST" style="display:flex; flex-direction:column; gap:2px; margin-top:6px;">
+                        <input type="hidden" name="item_id" value="<?= $viewId ?>">
+                        
+                        <div style="position:relative;">
+                            <label>Target Schema Property Element (Type to Search Autocomplete Suggestions):</label>
+                            <input type="text" class="autocomplete-trigger" data-type="prop" placeholder="Search system configuration properties map..." required autocomplete="off">
+                            <input type="hidden" name="property_id" class="autocomplete-target">
+                            <div class="ac-dropdown"></div>
+                        </div>
+
+                        <div style="margin:4px 0; border:1px dashed #ccc; padding:4px; background:#fff;">
+                            <label><input type="radio" name="value_mode" value="text" checked onchange="toggleValueInputs(this)"> Free String / Remote Web URL Data Payload</label>
+                            <label style="margin-left:8px;"><input type="radio" name="value_mode" value="link_internal" onchange="toggleValueInputs(this)"> Link Node To Internal Database Entity</label>
+                            <label style="margin-left:8px;"><input type="radio" name="value_mode" value="link_wikidata" onchange="toggleValueInputs(this)"> Link Node To Wikidata Items</label>
+                        </div>
+
+                        <div id="wrapper-value-text">
+                            <input type="text" name="value" placeholder="Enter alphanumeric text statement or external hyperlink structure...">
+                        </div>
+
+                        <div id="wrapper-value-link" style="display:none; position:relative;">
+                            <input type="text" class="autocomplete-trigger" data-type="item" placeholder="Search item nodes database by name mapping..." autocomplete="off">
+                            <input type="hidden" name="internal_item_id" class="autocomplete-target">
+                            <div class="ac-dropdown"></div>
+                        </div>
+
+                        <div id="wrapper-value-wikidata" style="display:none; position:relative;">
+                            <input type="text" class="autocomplete-trigger" data-type="wikidata" placeholder="Type to search live remote Wikidata entities (e.g., Douglas Adams)..." autocomplete="off">
+                            <input type="hidden" name="wikidata_id" class="autocomplete-target">
+                            <input type="hidden" name="wikidata_label" class="autocomplete-extra-target">
+                            <div class="ac-dropdown"></div>
+                        </div>
+
+                        <input type="submit" value="Commit Statement Framework" style="margin-top:4px;" <?= $isBanned ? 'disabled' : '' ?>>
+                    </form>
+                </details>
+            </div>
+
         <?php endif; ?>
 
     <?php
-    // ROUTE: PUBLIC LIST COMPILATION VIEWER
     elseif ($viewRoute === 'view_list'):
         $tgtUser = openssl_decrypt($_GET['user_id'], $cipher, $app_key, 0, $iv) ?? '';
         $tgtListName = $_GET['list_name'] ?? '';
@@ -821,23 +867,68 @@ function render_value($val) {
         if (!$targetList): echo "<div class='alert'>The specified user data compilation list was modified or pulled from access availability.</div>";
         else: 
             $displayTgtUser = ($tgtUser === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($_GET['user_id']);
+            $canEdit = ($tgtUser === $currentUserId) || !empty($targetList['is_public']);
         ?>
-            <h2>Curated Public Graph Set Index: <?= htmlspecialchars($tgtListName) ?> [Published by Node: <?= $displayTgtUser ?>]</h2>
-            <table>
-                <tr><th>Assigned Node Identity</th><th>Curator Annotation Log Explanations</th></tr>
-                <?php if (empty($targetList['items'])): ?>
-                    <tr><td colspan="2" style="color:#aaa; text-align:center;">No tracking matrix tokens associated inside this bucket container.</td></tr>
-                <?php else: foreach ($targetList['items'] as $itId): $itObj = db_get_item($itId); ?>
-                    <tr>
-                        <td><a href="?id=<?= $itId ?>"><strong><?= htmlspecialchars($itObj['label'] ?? "Q$itId") ?></strong> (Q<?= $itId ?>)</a></td>
-                        <td><?= htmlspecialchars($targetList['comments'][$itId] ?? 'No metadata descriptors applied.') ?></td>
-                    </tr>
-                <?php endforeach; endif; ?>
-            </table>
+            <div style="background:#f1f2f3; border:1px solid #d1d5da; padding:6px; margin-bottom:6px;">
+                <h2>Curated Graph Set Index: <?= htmlspecialchars($tgtListName) ?> [Published by Node: <?= $displayTgtUser ?>]</h2>
+                <span class="badge"><?= !empty($targetList['is_public']) ? '🔓 Public & Editable Collaboration Frame' : '🔒 Private Configuration Map' ?></span>
+                
+                <?php if ($canEdit): ?>
+                <form action="?route=manage_lists" method="POST" style="margin:8px 0; display:flex; flex-direction:column; gap:2px; background:#fff; padding:4px; border:1px solid #ccc;">
+                    <input type="hidden" name="sub_action" value="add_item_to_list">
+                    <input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>">
+                    <input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
+                    
+                    <div style="position:relative;">
+                        <label>Inject Target Node (Type to Autocomplete Search Database):</label>
+                        <input type="text" class="autocomplete-trigger" data-type="item" placeholder="Search entity node target label..." required autocomplete="off">
+                        <input type="hidden" name="internal_item_id" class="autocomplete-target">
+                        <div class="ac-dropdown"></div>
+                    </div>
+                    
+                    <input type="text" name="comment" placeholder="Annotation index notes..." style="margin:2px 0;">
+                    <input type="submit" value="Bind Node Item to List Matrix" <?= $isBanned ? 'disabled' : '' ?>>
+                </form>
+                <?php endif; ?>
+
+                <table>
+                    <tr><th>Linked Entity Target</th><th>Curator Annotation Remarks</th><?php if ($canEdit): ?><th>Sequence Mgmt</th><th>Target Actions</th><?php endif; ?></tr>
+                    <?php if (empty($targetList['items'])): ?>
+                        <tr><td colspan="<?= $canEdit ? '4' : '2' ?>" style="color:#aaa; text-align:center;">No tracking matrix tokens associated inside this bucket container.</td></tr>
+                    <?php else: foreach ($targetList['items'] as $itId): $itObj = db_get_item($itId); ?>
+                        <tr>
+                            <td><a href="?id=<?= $itId ?>"><strong><?= htmlspecialchars($itObj['label'] ?? "Q$itId") ?></strong> (Q<?= $itId ?>)</a></td>
+                            <td>
+                                <?php if ($canEdit): ?>
+                                <form action="?route=manage_lists" method="POST" style="display:flex; gap:2px; margin:0; width:100%;">
+                                    <input type="hidden" name="sub_action" value="update_comment"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
+                                    <input type="text" name="comment" value="<?= htmlspecialchars($targetList['comments'][$itId] ?? '') ?>" style="margin:0; font-size:10px; padding:1px 3px;">
+                                    <input type="submit" value="Save" style="padding:1px 4px; font-size:10px;" <?= $isBanned ? 'disabled' : '' ?>>
+                                </form>
+                                <?php else: echo htmlspecialchars($targetList['comments'][$itId] ?? 'No metadata descriptors applied.'); endif; ?>
+                            </td>
+                            <?php if ($canEdit): ?>
+                            <td>
+                                <form action="?route=manage_lists" method="POST" style="display:inline;">
+                                    <input type="hidden" name="sub_action" value="rearrange_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
+                                    <button type="submit" name="dir" value="up" <?= $isBanned ? 'disabled' : '' ?>>▲</button>
+                                    <button type="submit" name="dir" value="down" <?= $isBanned ? 'disabled' : '' ?>>▼</button>
+                                </form>
+                            </td>
+                            <td>
+                                <form action="?route=manage_lists" method="POST" style="display:inline;">
+                                    <input type="hidden" name="sub_action" value="remove_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
+                                    <input type="submit" class="action-btn" value="[Expel Element]" <?= $isBanned ? 'disabled' : '' ?>>
+                                </form>
+                            </td>
+                            <?php endif; ?>
+                        </tr>
+                    <?php endforeach; endif; ?>
+                </table>
+            </div>
         <?php endif; ?>
 
     <?php
-    // ROUTE: THREADED COMMUNITY DISCUSSION BOARD
     elseif ($viewRoute === 'forum'): ?>
         <h2>Structured System Discussion Framework Channels</h2>
         <div class="col" style="margin-bottom:4px;">
@@ -855,7 +946,7 @@ function render_value($val) {
             $displayThreadAuthor = ($thread['user_id'] === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars(openssl_encrypt($thread['user_id'], $cipher, $app_key, 0, $iv));
         ?>
             <div class="forum-card">
-                <div style="display:flex; justify-content:between; align-items:center;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>💬 <a href="?route=forum_view&thread_id=<?= $tId ?>"><strong><?= htmlspecialchars($thread['title']) ?></strong></a></h3>
                     <div style="margin-left:auto;">
                         <span class="badge">Replies Count: <?= count($thread['replies']) ?></span>
@@ -872,7 +963,6 @@ function render_value($val) {
         <?php endforeach; endif; ?>
 
     <?php
-    // ROUTE: MODULAR THREAD COMMENT MATRIX VIEW
     elseif ($viewRoute === 'forum_view'):
         $tId = $_GET['thread_id'] ?? '';
         $thread = $forum[$tId] ?? null;
@@ -923,7 +1013,6 @@ function render_value($val) {
         <?php endif; ?>
 
     <?php
-    // ROUTE: PROFILE CONFIGURATION SPACE
     elseif ($viewRoute === 'profile'): ?>
         <h2>Custom User Entity Parameters Profile: <?= ($currentUserId === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($currentUserId) ?></h2>
         <div class="grid">
@@ -954,6 +1043,10 @@ function render_value($val) {
                 <form action="?route=manage_lists" method="POST">
                     <input type="hidden" name="sub_action" value="create">
                     <input type="text" name="list_name" required placeholder="Enter custom distinct listing title...">
+                    <select name="visibility" required style="margin-bottom:4px;">
+                        <option value="private">🔒 Private Matrix Isolation</option>
+                        <option value="public">🔓 Publicly Editable Collaboration Frame</option>
+                    </select>
                     <input type="submit" value="Instantiate Tracking Index" <?= $isBanned ? 'disabled' : '' ?>>
                 </form>
             </div>
@@ -965,8 +1058,8 @@ function render_value($val) {
         if (empty($myLists)): echo "<p style='color:#666;'>No index data sets created under current profile token context.</p>";
         else: foreach($myLists as $lName => $lData): ?>
             <div style="background:#f1f2f3; border:1px solid #d1d5da; padding:6px; margin-bottom:6px;">
-                <div style="display:flex; justify-content:between; align-items:center;">
-                    <h3>📁 Compilation: <?= htmlspecialchars($lName) ?></h3>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h3>📁 Compilation: <?= htmlspecialchars($lName) ?> <?= !empty($lData['is_public']) ? '<span class="badge">Public</span>' : '<span class="badge">Private</span>' ?></h3>
                     <div style="margin-left:auto;">
                         <form action="?route=manage_lists" method="POST" style="display:inline;">
                             <input type="hidden" name="sub_action" value="rename"><input type="hidden" name="old_name" value="<?= htmlspecialchars($lName) ?>">
@@ -1031,7 +1124,6 @@ function render_value($val) {
         <?php endforeach; endif; ?>
 
     <?php
-    // ROUTE: MASTER SUPERUSER TELEMETRY TERMINAL
     elseif ($viewRoute === 'admin' && $currentUserId === SUPERUSER_ID): ?>
         <h2>System Telemetry Monitoring Console Layer</h2>
         <div class="grid">
@@ -1107,7 +1199,6 @@ function render_value($val) {
 </div>
 
 <script>
-// INFINITE STREAM PAGINATION SUBSYSTEM FOR ITEMS NODE LISTING
 let streamOffsetPosition = 0;
 function fetchNextStreamBatch() {
     const tableBody = document.getElementById('items-stream-body');
@@ -1130,7 +1221,6 @@ function fetchNextStreamBatch() {
         });
 }
 
-// ASYNCHRONOUS ENGINE FOR TELEMETRY ENGINE LOG RETRIEVAL
 let logOffsetPosition = 0;
 function fetchNextLogBatch() {
     const logContainer = document.getElementById('admin-logs-stream');
@@ -1175,7 +1265,6 @@ function toggleMatrixColumns() {
     });
 }
 
-// AUTOCOMPLETE INITIALIZATION MAP
 document.addEventListener("DOMContentLoaded", function() {
     if (document.getElementById('items-stream-body')) {
         fetchNextStreamBatch();
@@ -1212,7 +1301,6 @@ document.addEventListener("DOMContentLoaded", function() {
                 return;
             }
 
-            // Set dynamic delay depending on local vs remote search engine
             const delayTime = (actionType === 'suggest_wikidata') ? 320 : 180;
 
             debouncingTimer = setTimeout(() => {
@@ -1258,14 +1346,13 @@ document.addEventListener("DOMContentLoaded", function() {
         });
     });
 
-    // Drag and Drop Reordering Subsystem
     let draggedRow = null;
 
     document.querySelectorAll('.draggable-row').forEach(row => {
         row.addEventListener('dragstart', function(e) {
             draggedRow = this;
             e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', this.getAttribute('data-idx')); // Required for Firefox
+            e.dataTransfer.setData('text/plain', this.getAttribute('data-idx')); 
             setTimeout(() => { 
                 this.style.background = '#e1e4e8'; 
                 this.style.opacity = '0.6'; 
@@ -1283,11 +1370,10 @@ document.addEventListener("DOMContentLoaded", function() {
         });
 
         row.addEventListener('dragover', function(e) {
-            e.preventDefault(); // Necessary to allow dropping
+            e.preventDefault(); 
             if (this !== draggedRow) {
                 let rect = this.getBoundingClientRect();
                 let relY = e.clientY - rect.top;
-                // Give visual feedback based on upper/lower half of the hovered row
                 if (relY < rect.height / 2) {
                     this.style.borderTop = '2px solid #0366d6';
                     this.style.borderBottom = '';
@@ -1316,17 +1402,14 @@ document.addEventListener("DOMContentLoaded", function() {
                 let rect = this.getBoundingClientRect();
                 let relY = e.clientY - rect.top;
                 
-                // Adjust target index if dropping on the bottom half
                 if (relY >= rect.height / 2) {
                     targetIdx++;
                 }
                 
-                // Array mutation to build the new structural order
                 allRows.splice(draggedIdx, 1);
                 if (targetIdx > draggedIdx) targetIdx--; 
                 allRows.splice(targetIdx, 0, draggedRow);
                 
-                // Extract original flat array indices in their new order
                 let newOrder = allRows.map(r => r.getAttribute('data-idx'));
                 document.getElementById('new_order_input').value = newOrder.join(',');
                 document.getElementById('reorder-form').submit();
