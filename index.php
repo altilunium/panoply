@@ -2,6 +2,7 @@
 date_default_timezone_set('Asia/Jakarta');
 define('DB_DIR', __DIR__ . '/wikidata_local_db');
 define('SUPERUSER_ID', 'SET UP YOURS');
+define('WRITEUNLOCK_KEY', 'SET UP YOURS');
 $app_key = 'your-super-secret-app-wide-key!'; 
 $cipher = 'AES-256-CBC';
 $iv = substr(hash('sha256', 'static-iv-for-single-file-prototype'), 0, 16);
@@ -65,15 +66,16 @@ if (!isset($index['registry'])) {
 }
 
 if (!isset($users[$currentUserId])) {
-    $users[$currentUserId] = ['id' => $currentUserId, 'ip' => $currentUserIP, 'ua' => $currentUserUA, 'banned' => false, 'ban_until' => 0, 'lists' => [], 'messages' => []];
+    $users[$currentUserId] = ['id' => $currentUserId, 'ip' => $currentUserIP, 'ua' => $currentUserUA, 'banned' => false, 'ban_until' => 0, 'lists' => [], 'messages' => [], 'role' => 'readonly'];
 } else {
     $users[$currentUserId]['ip'] = $currentUserIP;
     $users[$currentUserId]['ua'] = $currentUserUA;
+    if (!isset($users[$currentUserId]['role'])) $users[$currentUserId]['role'] = 'readonly';
 }
 db_save_json('users.json', $users);
 
 if (!isset($users[SUPERUSER_ID])) {
-    $users[SUPERUSER_ID] = ['id' => SUPERUSER_ID, 'ip' => '127.0.0.1', 'ua' => 'System Engine', 'banned' => false, 'ban_until' => 0, 'lists' => [], 'messages' => []];
+    $users[SUPERUSER_ID] = ['id' => SUPERUSER_ID, 'ip' => '127.0.0.1', 'ua' => 'System Engine', 'banned' => false, 'ban_until' => 0, 'lists' => [], 'messages' => [], 'role' => 'readwrite'];
     db_save_json('users.json', $users);
 }
 
@@ -82,6 +84,11 @@ if (!empty($users[$currentUserId]['banned'])) {
     if ($users[$currentUserId]['ban_until'] == -1 || $users[$currentUserId]['ban_until'] > time()) {
         $isBanned = true;
     }
+}
+
+$canWrite = false;
+if (($users[$currentUserId]['role'] ?? 'readonly') === 'readwrite' || $currentUserId === SUPERUSER_ID) {
+    $canWrite = true;
 }
 
 function log_activity($userId, $action, $detail) {
@@ -191,40 +198,58 @@ $msg = "";
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
     $route = $_GET['route'] ?? '';
 
+    if ($route === 'unlock_write') {
+        if (($_POST['password'] ?? '') === WRITEUNLOCK_KEY) {
+            $users[$currentUserId]['role'] = 'readwrite';
+            db_save_json('users.json', $users);
+            log_activity($currentUserId, 'unlock_write', "Granted read-write privileges via passcode");
+        } else {
+            $msg = "Error: Invalid authorization code.";
+        }
+    }
+
     if ($route === 'reorder_statements_bulk') {
-        $itemId = $_POST['item_id'] ?? '';
-        $newOrder = explode(',', $_POST['new_order'] ?? '');
-        $item = db_get_item($itemId);
-        
-        if ($item && !empty($newOrder)) {
-            $newStatements = [];
-            foreach ($newOrder as $oldIdx) {
-                if ($oldIdx !== '' && isset($item['statements'][$oldIdx])) {
-                    $newStatements[] = $item['statements'][$oldIdx];
+        if (!$canWrite) {
+            $msg = "Error: Read-write privilege required to modify item order.";
+        } else {
+            $itemId = $_POST['item_id'] ?? '';
+            $newOrder = explode(',', $_POST['new_order'] ?? '');
+            $item = db_get_item($itemId);
+            
+            if ($item && !empty($newOrder)) {
+                $newStatements = [];
+                foreach ($newOrder as $oldIdx) {
+                    if ($oldIdx !== '' && isset($item['statements'][$oldIdx])) {
+                        $newStatements[] = $item['statements'][$oldIdx];
+                    }
                 }
+                $item['statements'] = $newStatements;
+                db_save_item($itemId, $item);
+                header("Location: ?id=" . $itemId . "&show_matrix=1");
+                exit;
             }
-            $item['statements'] = $newStatements;
-            db_save_item($itemId, $item);
-            header("Location: ?id=" . $itemId . "&show_matrix=1");
-            exit;
         }
     }
 
     if ($route === 'add_item') {
-        $label = trim($_POST['label'] ?? '');
-        if ($label !== '') {
-            $lowerLabel = strtolower($label);
-            if (isset($index['labels'][$lowerLabel])) {
-                $msg = "Error: An item matching this entity identity already exists.";
-            } else {
-                $newId = $index['next_item_id']++;
-                $index['labels'][$lowerLabel] = $newId;
-                $index['registry'][$newId] = ['label' => $label, 'timestamp' => time()];
-                db_save_item($newId, ['label' => $label, 'statements' => []]);
-                db_save_json('index.json', $index);
-                log_activity($currentUserId, 'add_item', "Created item Q$newId: $label");
-                header("Location: ?id=" . $newId);
-                exit;
+        if (!$canWrite) {
+            $msg = "Error: Read-write privilege required to add items.";
+        } else {
+            $label = trim($_POST['label'] ?? '');
+            if ($label !== '') {
+                $lowerLabel = strtolower($label);
+                if (isset($index['labels'][$lowerLabel])) {
+                    $msg = "Error: An item matching this entity identity already exists.";
+                } else {
+                    $newId = $index['next_item_id']++;
+                    $index['labels'][$lowerLabel] = $newId;
+                    $index['registry'][$newId] = ['label' => $label, 'timestamp' => time()];
+                    db_save_item($newId, ['label' => $label, 'statements' => []]);
+                    db_save_json('index.json', $index);
+                    log_activity($currentUserId, 'add_item', "Created item Q$newId: $label");
+                    header("Location: ?id=" . $newId);
+                    exit;
+                }
             }
         }
     }
@@ -250,24 +275,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
     }
 
     if ($route === 'edit_item_label') {
-        $itemId = $_POST['item_id'] ?? '';
-        $newLabel = trim($_POST['new_label'] ?? '');
-        $item = db_get_item($itemId);
-        if ($item && $newLabel !== '') {
-            $oldLower = strtolower($item['label']);
-            $newLower = strtolower($newLabel);
-            if ($oldLower !== $newLower && isset($index['labels'][$newLower])) {
-                $msg = "Error: Label update collides with an existing item matrix entry.";
-            } else {
-                unset($index['labels'][$oldLower]);
-                $index['labels'][$newLower] = $itemId;
-                $index['registry'][$itemId]['label'] = $newLabel;
-                $item['label'] = $newLabel;
-                db_save_item($itemId, $item);
-                db_save_json('index.json', $index);
-                log_activity($currentUserId, 'edit_label', "Updated item Q$itemId label to $newLabel");
-                header("Location: ?id=" . $itemId);
-                exit;
+        if (!$canWrite) {
+            $msg = "Error: Read-write privilege required to modify item labels.";
+        } else {
+            $itemId = $_POST['item_id'] ?? '';
+            $newLabel = trim($_POST['new_label'] ?? '');
+            $item = db_get_item($itemId);
+            if ($item && $newLabel !== '') {
+                $oldLower = strtolower($item['label']);
+                $newLower = strtolower($newLabel);
+                if ($oldLower !== $newLower && isset($index['labels'][$newLower])) {
+                    $msg = "Error: Label update collides with an existing item matrix entry.";
+                } else {
+                    unset($index['labels'][$oldLower]);
+                    $index['labels'][$newLower] = $itemId;
+                    $index['registry'][$itemId]['label'] = $newLabel;
+                    $item['label'] = $newLabel;
+                    db_save_item($itemId, $item);
+                    db_save_json('index.json', $index);
+                    log_activity($currentUserId, 'edit_label', "Updated item Q$itemId label to $newLabel");
+                    header("Location: ?id=" . $itemId);
+                    exit;
+                }
             }
         }
     }
@@ -294,79 +323,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
     }
 
     if ($route === 'add_statement') {
-        $itemId = $_POST['item_id'] ?? '';
-        $pId = $_POST['property_id'] ?? '';
-        $mode = $_POST['value_mode'] ?? 'text';
-        $val = trim($_POST['value'] ?? '');
-        
-        if ($mode === 'link_internal' && !empty($_POST['internal_item_id'])) {
-            $val = ':' . $_POST['internal_item_id'];
-        } elseif ($mode === 'link_wikidata' && !empty($_POST['wikidata_id'])) {
-            $wdId = trim($_POST['wikidata_id']);
-            $wdLabel = trim($_POST['wikidata_label'] ?? '');
-            $createShadow = isset($_POST['create_shadow']) && $_POST['create_shadow'] === '1';
+        if (!$canWrite) {
+            $msg = "Error: Read-write privilege required to append statements.";
+        } else {
+            $itemId = $_POST['item_id'] ?? '';
+            $pId = $_POST['property_id'] ?? '';
+            $mode = $_POST['value_mode'] ?? 'text';
+            $val = trim($_POST['value'] ?? '');
             
-            if ($createShadow) {
-                if (!isset($index['wd_shadows'][$wdId])) {
-                    $newId = $index['next_item_id']++;
-                    $index['wd_shadows'][$wdId] = $newId;
-                    
-                    $shadowLabel = $wdLabel;
-                    if (isset($index['labels'][strtolower($shadowLabel)])) {
-                        $shadowLabel .= " ($wdId)";
+            if ($mode === 'link_internal' && !empty($_POST['internal_item_id'])) {
+                $val = ':' . $_POST['internal_item_id'];
+            } elseif ($mode === 'link_wikidata' && !empty($_POST['wikidata_id'])) {
+                $wdId = trim($_POST['wikidata_id']);
+                $wdLabel = trim($_POST['wikidata_label'] ?? '');
+                $createShadow = isset($_POST['create_shadow']) && $_POST['create_shadow'] === '1';
+                
+                if ($createShadow) {
+                    if (!isset($index['wd_shadows'][$wdId])) {
+                        $newId = $index['next_item_id']++;
+                        $index['wd_shadows'][$wdId] = $newId;
+                        
+                        $shadowLabel = $wdLabel;
+                        if (isset($index['labels'][strtolower($shadowLabel)])) {
+                            $shadowLabel .= " ($wdId)";
+                        }
+                        $index['labels'][strtolower($shadowLabel)] = $newId;
+                        $index['registry'][$newId] = ['label' => $shadowLabel, 'timestamp' => time()];
+                        db_save_item($newId, ['label' => $shadowLabel, 'statements' => [], 'wd_id' => $wdId]);
+                        db_save_json('index.json', $index);
+                        log_activity($currentUserId, 'create_shadow_node', "Generated shadow link Q$newId mapping to $wdId");
                     }
-                    $index['labels'][strtolower($shadowLabel)] = $newId;
-                    $index['registry'][$newId] = ['label' => $shadowLabel, 'timestamp' => time()];
-                    db_save_item($newId, ['label' => $shadowLabel, 'statements' => [], 'wd_id' => $wdId]);
-                    db_save_json('index.json', $index);
-                    log_activity($currentUserId, 'create_shadow_node', "Generated shadow link Q$newId mapping to $wdId");
+                    $val = ':' . $index['wd_shadows'][$wdId];
+                } else {
+                    $val = ';' . $wdId . '|' . $wdLabel;
                 }
-                $val = ':' . $index['wd_shadows'][$wdId];
-            } else {
-                $val = ';' . $wdId . '|' . $wdLabel;
             }
-        }
-        
-        $item = db_get_item($itemId);
-        if ($item && isset($index['properties'][$pId]) && !$index['properties'][$pId]['deleted']) {
-            $item['statements'][] = ['p_id' => $pId, 'value' => $val];
-            db_save_item($itemId, $item);
             
-            if (strpos($val, ':') === 0) {
-                $targetId = substr($val, 1);
-                $index['backlinks'][$targetId][] = $itemId;
-                $index['backlinks'][$targetId] = array_unique($index['backlinks'][$targetId]);
-                db_save_json('index.json', $index);
-            }
+            $item = db_get_item($itemId);
+            if ($item && isset($index['properties'][$pId]) && !$index['properties'][$pId]['deleted']) {
+                $item['statements'][] = ['p_id' => $pId, 'value' => $val];
+                db_save_item($itemId, $item);
+                
+                if (strpos($val, ':') === 0) {
+                    $targetId = substr($val, 1);
+                    $index['backlinks'][$targetId][] = $itemId;
+                    $index['backlinks'][$targetId] = array_unique($index['backlinks'][$targetId]);
+                    db_save_json('index.json', $index);
+                }
 
-            $propStringName = $index['properties'][$pId]['label'] ?? $pId;
-            $resolvedValueDetails = $val;
-            if (strpos($val, ':') === 0) {
-                $resolvingTargetId = substr($val, 1);
-                $resolvingItemObj = db_get_item($resolvingTargetId);
-                $resolvedValueDetails = ($resolvingItemObj['label'] ?? "Unknown Entity") . " (Q" . $resolvingTargetId . ")";
-            } elseif (strpos($val, ';') === 0) {
-                $parts = explode('|', substr($val, 1));
-                $resolvedValueDetails = ($parts[1] ?? $parts[0]) . " (" . $parts[0] . ") [Wikidata]";
+                $propStringName = $index['properties'][$pId]['label'] ?? $pId;
+                $resolvedValueDetails = $val;
+                if (strpos($val, ':') === 0) {
+                    $resolvingTargetId = substr($val, 1);
+                    $resolvingItemObj = db_get_item($resolvingTargetId);
+                    $resolvedValueDetails = ($resolvingItemObj['label'] ?? "Unknown Entity") . " (Q" . $resolvingTargetId . ")";
+                } elseif (strpos($val, ';') === 0) {
+                    $parts = explode('|', substr($val, 1));
+                    $resolvedValueDetails = ($parts[1] ?? $parts[0]) . " (" . $parts[0] . ") [Wikidata]";
+                }
+                log_activity($currentUserId, 'add_statement', "Added claim to Q$itemId: $propStringName ($pId) -> $resolvedValueDetails");
+                
+                header("Location: ?id=" . $itemId);
+                exit;
             }
-            log_activity($currentUserId, 'add_statement', "Added claim to Q$itemId: $propStringName ($pId) -> $resolvedValueDetails");
-            
-            header("Location: ?id=" . $itemId);
-            exit;
         }
     }
 
     if ($route === 'delete_statement') {
-        $itemId = $_POST['item_id'] ?? '';
-        $indexPos = intval($_POST['index'] ?? -1);
-        $item = db_get_item($itemId);
-        if ($item && $indexPos >= 0 && isset($item['statements'][$indexPos])) {
-            $deletedStmt = $item['statements'][$indexPos];
-            array_splice($item['statements'], $indexPos, 1);
-            db_save_item($itemId, $item);
-            log_activity($currentUserId, 'delete_statement', "Removed statement entry position $indexPos from Q$itemId");
-            header("Location: ?id=" . $itemId . "&show_matrix=1");
-            exit;
+        if (!$canWrite) {
+            $msg = "Error: Read-write privilege required to delete statements.";
+        } else {
+            $itemId = $_POST['item_id'] ?? '';
+            $indexPos = intval($_POST['index'] ?? -1);
+            $item = db_get_item($itemId);
+            if ($item && $indexPos >= 0 && isset($item['statements'][$indexPos])) {
+                $deletedStmt = $item['statements'][$indexPos];
+                array_splice($item['statements'], $indexPos, 1);
+                db_save_item($itemId, $item);
+                log_activity($currentUserId, 'delete_statement', "Removed statement entry position $indexPos from Q$itemId");
+                header("Location: ?id=" . $itemId . "&show_matrix=1");
+                exit;
+            }
         }
     }
 
@@ -617,7 +654,7 @@ function render_value($val) {
 <body>
 
 <header>
-    <h1><a href="?" style="color:#fff;">⚙️ Altilunium Panoply v26.6.22</a> <span class="badge"><?= ($currentUserId === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($currentUserId) ?></span></h1>
+    <h1><a href="?" style="color:#fff;">⚙️ Altilunium Panoply v26.6.22</a> <span class="badge"><?= ($currentUserId === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($currentUserId) . ' (' . htmlspecialchars($users[$currentUserId]['role'] ?? 'readonly') . ')' ?></span></h1>
     <nav>
         <a href="?">Items Node</a>
         <a href="?route=properties">Properties</a>
@@ -642,7 +679,7 @@ function render_value($val) {
                 <form action="?route=add_item" method="POST">
                     <label>Unique Matrix Label Signature:</label>
                     <input type="text" name="label" required placeholder="Enter exact original casing name...">
-                    <input type="submit" value="Publish Entity Node" <?= $isBanned ? 'disabled' : '' ?>>
+                    <input type="submit" value="Publish Entity Node" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                 </form>
             </div>
             <div class="col">
@@ -662,6 +699,12 @@ function render_value($val) {
                 <div style="text-align: center; margin-top: 4px;">
                     <button id="load-more-btn" onclick="fetchNextStreamBatch()">Download Next Segment Layer ↓</button>
                 </div>
+                <div style="text-align: center; margin-top: 8px;">
+                    <form action="?route=unlock_write" method="POST" id="unlock-form" style="display:inline;">
+                        <input type="hidden" name="password" id="unlock-password">
+                        <button type="button" onclick="let p = prompt('Enter override password:'); if(p){ document.getElementById('unlock-password').value = p; document.getElementById('unlock-form').submit(); }" style="background:transparent; border:none; font-size:16px; cursor:pointer;" title="Unlock read-write privileges">🔒</button>
+                    </form>
+                </div>
             </div>
         </div>
 
@@ -672,7 +715,7 @@ function render_value($val) {
                 <h2>Register Semantic Structural Property</h2>
                 <form action="?route=add_property" method="POST">
                     <input type="text" name="property_label" required placeholder="e.g., localized manufacturing origin">
-                    <input type="submit" value="Inject System Property" <?= $isBanned ? 'disabled' : '' ?>>
+                    <input type="submit" value="Inject System Property" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                 </form>
             </div>
             <div class="col">
@@ -715,7 +758,7 @@ function render_value($val) {
                     <input type="hidden" name="item_id" value="<?= $viewId ?>">
                     <strong>Entity Q<?= $viewId ?> Node Identity: </strong>
                     <input type="text" name="new_label" value="<?= htmlspecialchars($item['label']) ?>" style="margin:0; flex:1; font-weight:bold;field-sizing:content;">
-                    <input type="submit" value="Apply Identity Correction" <?= $isBanned ? 'disabled' : '' ?>>
+                    <input type="submit" value="Apply Identity Correction" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                     <button type="button" style="margin-left:4px; background:#6a737d;" onclick="toggleMatrixColumns()">modify order-action matrix</button>
                 </form>
                 <?php if ($currentUserId === SUPERUSER_ID): ?>
@@ -757,7 +800,7 @@ function render_value($val) {
                 ?>
                 <tbody class="property-group">
                     <?php foreach ($stmts as $i => $s): $idx = $s['idx']; $stmt = $s['stmt']; ?>
-                    <tr class="draggable-row" draggable="true" data-idx="<?= $idx ?>">
+                    <tr class="draggable-row" <?= $canWrite ? 'draggable="true"' : '' ?> data-idx="<?= $idx ?>">
                         <?php if ($i === 0): ?>
                         <td rowspan="<?= $rowspan ?>" style="background: #fff; vertical-align: middle;">
                             <strong><?= htmlspecialchars($propLabel) ?></strong> <span class="badge"><?= htmlspecialchars($pId) ?></span>
@@ -766,7 +809,7 @@ function render_value($val) {
                         
                         <td style="background: #fff;"><?= render_value($stmt['value']) ?></td>
                         
-                        <td class="matrix-col" style="text-align:center; cursor:grab; font-size:16px; color:#aaa; user-select: none;" title="Drag to reorder">
+                        <td class="matrix-col" style="text-align:center; cursor: <?= $canWrite ? 'grab' : 'not-allowed' ?>; font-size:16px; color:#aaa; user-select: none;" title="<?= $canWrite ? 'Drag to reorder' : 'Reorder disabled (readonly)' ?>">
                             ☰
                         </td>
                         
@@ -774,7 +817,7 @@ function render_value($val) {
                             <form action="?route=delete_statement" method="POST" style="display:inline;">
                                 <input type="hidden" name="item_id" value="<?= $viewId ?>">
                                 <input type="hidden" name="index" value="<?= $idx ?>">
-                                <input type="submit" class="action-btn" value="[Delete Assignment]" <?= $isBanned ? 'disabled' : '' ?> onclick="return confirm('Log statement extraction?');">
+                                <input type="submit" class="action-btn" value="[Delete Assignment]" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?> onclick="return confirm('Log statement extraction?');">
                             </form>
                         </td>
                     </tr>
@@ -860,7 +903,7 @@ function render_value($val) {
                             </label>
                         </div>
 
-                        <input type="submit" value="Commit Statement Framework" style="margin-top:4px;" <?= $isBanned ? 'disabled' : '' ?>>
+                        <input type="submit" value="Commit Statement Framework" style="margin-top:4px;" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                     </form>
                 </details>
             </div>
@@ -907,7 +950,7 @@ function render_value($val) {
                     </div>
                     
                     <input type="text" name="comment" placeholder="Annotation index notes..." style="margin:2px 0;">
-                    <input type="submit" value="Bind Node Item to List Matrix" <?= $isBanned ? 'disabled' : '' ?>>
+                    <input type="submit" value="Bind Node Item to List Matrix" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                 </form>
                 <?php endif; ?>
 
@@ -930,7 +973,7 @@ function render_value($val) {
                                 <form action="?route=manage_lists" method="POST" style="display:flex; gap:2px; margin:0; width:100%;">
                                     <input type="hidden" name="sub_action" value="update_comment"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
                                     <input type="text" name="comment" value="<?= htmlspecialchars($targetList['comments'][$itId] ?? '') ?>" style="margin:0; font-size:10px; padding:1px 3px;">
-                                    <input type="submit" value="Save" style="padding:1px 4px; font-size:10px;" <?= $isBanned ? 'disabled' : '' ?>>
+                                    <input type="submit" value="Save" style="padding:1px 4px; font-size:10px;" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                                 </form>
                                 <?php else: 
                                     $commentText = $targetList['comments'][$itId] ?? '';
@@ -941,14 +984,14 @@ function render_value($val) {
                             <td>
                                 <form action="?route=manage_lists" method="POST" style="display:inline;">
                                     <input type="hidden" name="sub_action" value="rearrange_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
-                                    <button type="submit" name="dir" value="up" <?= $isBanned ? 'disabled' : '' ?>>▲</button>
-                                    <button type="submit" name="dir" value="down" <?= $isBanned ? 'disabled' : '' ?>>▼</button>
+                                    <button type="submit" name="dir" value="up" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>▲</button>
+                                    <button type="submit" name="dir" value="down" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>▼</button>
                                 </form>
                             </td>
                             <td>
                                 <form action="?route=manage_lists" method="POST" style="display:inline;">
                                     <input type="hidden" name="sub_action" value="remove_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
-                                    <input type="submit" class="action-btn" value="[Expel Element]" <?= $isBanned ? 'disabled' : '' ?>>
+                                    <input type="submit" class="action-btn" value="[Expel Element]" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                                 </form>
                             </td>
                             <?php endif; ?>
@@ -1077,7 +1120,7 @@ function render_value($val) {
                         <option value="private">🔒 Private Matrix Isolation</option>
                         <option value="public">🔓 Publicly Editable Collaboration Frame</option>
                     </select>
-                    <input type="submit" value="Instantiate Tracking Index" <?= $isBanned ? 'disabled' : '' ?>>
+                    <input type="submit" value="Instantiate Tracking Index" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                 </form>
             </div>
         </div>
@@ -1094,11 +1137,11 @@ function render_value($val) {
                         <form action="?route=manage_lists" method="POST" style="display:inline;">
                             <input type="hidden" name="sub_action" value="rename"><input type="hidden" name="old_name" value="<?= htmlspecialchars($lName) ?>">
                             <input type="text" name="new_name" placeholder="Rename title profile..." style="width:120px; margin:0; font-size:10px;">
-                            <input type="submit" value="Update Flag Title" <?= $isBanned ? 'disabled' : '' ?>>
+                            <input type="submit" value="Update Flag Title" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                         </form>
                         <form action="?route=manage_lists" method="POST" style="display:inline; margin-left:4px;">
                             <input type="hidden" name="sub_action" value="delete"><input type="hidden" name="list_name" value="<?= htmlspecialchars($lName) ?>">
-                            <input type="submit" value="Purge Set List" <?= $isBanned ? 'disabled' : '' ?> onclick="return confirm('Purge compilation reference context?');">
+                            <input type="submit" value="Purge Set List" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?> onclick="return confirm('Purge compilation reference context?');">
                         </form>
                     </div>
                 </div>
@@ -1115,7 +1158,7 @@ function render_value($val) {
                     </div>
                     
                     <input type="text" name="comment" placeholder="Annotation index notes..." style="margin:2px 0;">
-                    <input type="submit" value="Bind Node Item to List Matrix" <?= $isBanned ? 'disabled' : '' ?>>
+                    <input type="submit" value="Bind Node Item to List Matrix" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                 </form>
 
                 <table>
@@ -1131,20 +1174,20 @@ function render_value($val) {
                                     <input type="hidden" name="list_name" value="<?= htmlspecialchars($lName) ?>">
                                     <input type="hidden" name="item_id" value="<?= $itId ?>">
                                     <input type="text" name="comment" value="<?= htmlspecialchars($lData['comments'][$itId] ?? '') ?>" style="margin:0; font-size:10px; padding:1px 3px;">
-                                    <input type="submit" value="Save" style="padding:1px 4px; font-size:10px;" <?= $isBanned ? 'disabled' : '' ?>>
+                                    <input type="submit" value="Save" style="padding:1px 4px; font-size:10px;" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                                 </form>
                             </td>
                             <td>
                                 <form action="?route=manage_lists" method="POST" style="display:inline;">
                                     <input type="hidden" name="sub_action" value="rearrange_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($lName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>">
-                                    <button type="submit" name="dir" value="up" <?= $isBanned ? 'disabled' : '' ?>>▲</button>
-                                    <button type="submit" name="dir" value="down" <?= $isBanned ? 'disabled' : '' ?>>▼</button>
+                                    <button type="submit" name="dir" value="up" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>▲</button>
+                                    <button type="submit" name="dir" value="down" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>▼</button>
                                 </form>
                             </td>
                             <td>
                                 <form action="?route=manage_lists" method="POST" style="display:inline;">
                                     <input type="hidden" name="sub_action" value="remove_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($lName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>">
-                                    <input type="submit" class="action-btn" value="[Expel Element]" <?= $isBanned ? 'disabled' : '' ?>>
+                                    <input type="submit" class="action-btn" value="[Expel Element]" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                                 </form>
                             </td>
                         </tr>
@@ -1380,6 +1423,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
     document.querySelectorAll('.draggable-row').forEach(row => {
         row.addEventListener('dragstart', function(e) {
+            if(this.getAttribute('draggable') !== 'true') { e.preventDefault(); return; }
             draggedRow = this;
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/plain', this.getAttribute('data-idx')); 
@@ -1400,6 +1444,7 @@ document.addEventListener("DOMContentLoaded", function() {
         });
 
         row.addEventListener('dragover', function(e) {
+            if(!draggedRow) return;
             e.preventDefault(); 
             if (this !== draggedRow) {
                 let rect = this.getBoundingClientRect();
@@ -1420,6 +1465,7 @@ document.addEventListener("DOMContentLoaded", function() {
         });
 
         row.addEventListener('drop', function(e) {
+            if(!draggedRow) return;
             e.preventDefault();
             this.style.borderTop = '';
             this.style.borderBottom = '';
