@@ -304,23 +304,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
         } elseif ($mode === 'link_wikidata' && !empty($_POST['wikidata_id'])) {
             $wdId = trim($_POST['wikidata_id']);
             $wdLabel = trim($_POST['wikidata_label'] ?? '');
+            $createShadow = isset($_POST['create_shadow']) && $_POST['create_shadow'] === '1';
             
-            if (!isset($index['wd_shadows'][$wdId])) {
-                $newId = $index['next_item_id']++;
-                $index['wd_shadows'][$wdId] = $newId;
-                
-                $shadowLabel = $wdLabel;
-                if (isset($index['labels'][strtolower($shadowLabel)])) {
-                    $shadowLabel .= " ($wdId)";
+            if ($createShadow) {
+                if (!isset($index['wd_shadows'][$wdId])) {
+                    $newId = $index['next_item_id']++;
+                    $index['wd_shadows'][$wdId] = $newId;
+                    
+                    $shadowLabel = $wdLabel;
+                    if (isset($index['labels'][strtolower($shadowLabel)])) {
+                        $shadowLabel .= " ($wdId)";
+                    }
+                    $index['labels'][strtolower($shadowLabel)] = $newId;
+                    $index['registry'][$newId] = ['label' => $shadowLabel, 'timestamp' => time()];
+                    db_save_item($newId, ['label' => $shadowLabel, 'statements' => [], 'wd_id' => $wdId]);
+                    db_save_json('index.json', $index);
+                    log_activity($currentUserId, 'create_shadow_node', "Generated shadow link Q$newId mapping to $wdId");
                 }
-                $index['labels'][strtolower($shadowLabel)] = $newId;
-                $index['registry'][$newId] = ['label' => $shadowLabel, 'timestamp' => time()];
-                db_save_item($newId, ['label' => $shadowLabel, 'statements' => [], 'wd_id' => $wdId]);
-                db_save_json('index.json', $index);
-                log_activity($currentUserId, 'create_shadow_node', "Generated shadow link Q$newId mapping to $wdId");
+                $val = ':' . $index['wd_shadows'][$wdId];
+            } else {
+                $val = ';' . $wdId . '|' . $wdLabel;
             }
-            
-            $val = ':' . $index['wd_shadows'][$wdId];
         }
         
         $item = db_get_item($itemId);
@@ -448,7 +452,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
         }
         
         if ($ownerId !== $currentUserId) {
-            header("Location: ?route=view_list&user_id=" . urlencode(openssl_encrypt($ownerId, $cipher, $app_key, 0, $iv)) . "&list_name=" . urlencode($listName));
+            header("Location: ?route=view_list&user_id=" . urlencode(openssl_encrypt($ownerId, $cipher, $app_key, 0, $iv)) . "&list_name=" . urlencode($listName) . (isset($_GET['edit_mode']) ? '&edit_mode=1' : ''));
         } else {
             header("Location: ?route=profile");
         }
@@ -850,6 +854,10 @@ function render_value($val) {
                             <input type="hidden" name="wikidata_id" class="autocomplete-target">
                             <input type="hidden" name="wikidata_label" class="autocomplete-extra-target">
                             <div class="ac-dropdown"></div>
+                            <label style="display:block; margin-top:6px; font-size:11px;">
+                                <input type="checkbox" name="create_shadow" value="1" checked>
+                                Instantiate Local Shadow Entity Node (Uncheck to append as a simple external wdlite link)
+                            </label>
                         </div>
 
                         <input type="submit" value="Commit Statement Framework" style="margin-top:4px;" <?= $isBanned ? 'disabled' : '' ?>>
@@ -868,12 +876,24 @@ function render_value($val) {
         else: 
             $displayTgtUser = ($tgtUser === SUPERUSER_ID) ? 'system administrator' : htmlspecialchars($_GET['user_id']);
             $canEdit = ($tgtUser === $currentUserId) || !empty($targetList['is_public']);
+            $isEditMode = isset($_GET['edit_mode']) && $_GET['edit_mode'] === '1';
         ?>
             <div style="background:#f1f2f3; border:1px solid #d1d5da; padding:6px; margin-bottom:6px;">
-                <h2>Curated Graph Set Index: <?= htmlspecialchars($tgtListName) ?> [Published by Node: <?= $displayTgtUser ?>]</h2>
-                <span class="badge"><?= !empty($targetList['is_public']) ? '🔓 Public & Editable Collaboration Frame' : '🔒 Private Configuration Map' ?></span>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                    <h2 style="margin:0; border:none;">Curated Graph Set Index: <?= htmlspecialchars($tgtListName) ?> [Published by Node: <?= $displayTgtUser ?>]</h2>
+                    <?php if ($canEdit): ?>
+                        <?php if ($isEditMode): ?>
+                            <a href="?route=view_list&user_id=<?= urlencode($_GET['user_id']) ?>&list_name=<?= urlencode($tgtListName) ?>" class="badge" style="background:#d73a49; color:#fff; padding:4px 8px; text-decoration:none;">Finish Editing</a>
+                        <?php else: ?>
+                            <a href="?route=view_list&user_id=<?= urlencode($_GET['user_id']) ?>&list_name=<?= urlencode($tgtListName) ?>&edit_mode=1" class="badge" style="background:#28a745; color:#fff; padding:4px 8px; text-decoration:none;">✎ Edit List</a>
+                        <?php endif; ?>
+                    <?php endif; ?>
+                </div>
+                <div style="margin-bottom:8px;">
+                    <span class="badge"><?= !empty($targetList['is_public']) ? '🔓 Public & Editable Collaboration Frame' : '🔒 Private Configuration Map' ?></span>
+                </div>
                 
-                <?php if ($canEdit): ?>
+                <?php if ($canEdit && $isEditMode): ?>
                 <form action="?route=manage_lists" method="POST" style="margin:8px 0; display:flex; flex-direction:column; gap:2px; background:#fff; padding:4px; border:1px solid #ccc;">
                     <input type="hidden" name="sub_action" value="add_item_to_list">
                     <input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>">
@@ -892,22 +912,32 @@ function render_value($val) {
                 <?php endif; ?>
 
                 <table>
-                    <tr><th>Linked Entity Target</th><th>Curator Annotation Remarks</th><?php if ($canEdit): ?><th>Sequence Mgmt</th><th>Target Actions</th><?php endif; ?></tr>
+                    <tr>
+                        <th>Linked Entity Target</th>
+                        <th>Curator Annotation Remarks</th>
+                        <?php if ($canEdit && $isEditMode): ?>
+                            <th>Sequence Mgmt</th>
+                            <th>Target Actions</th>
+                        <?php endif; ?>
+                    </tr>
                     <?php if (empty($targetList['items'])): ?>
-                        <tr><td colspan="<?= $canEdit ? '4' : '2' ?>" style="color:#aaa; text-align:center;">No tracking matrix tokens associated inside this bucket container.</td></tr>
+                        <tr><td colspan="<?= ($canEdit && $isEditMode) ? '4' : '2' ?>" style="color:#aaa; text-align:center;">No tracking matrix tokens associated inside this bucket container.</td></tr>
                     <?php else: foreach ($targetList['items'] as $itId): $itObj = db_get_item($itId); ?>
                         <tr>
                             <td><a href="?id=<?= $itId ?>"><strong><?= htmlspecialchars($itObj['label'] ?? "Q$itId") ?></strong> (Q<?= $itId ?>)</a></td>
                             <td>
-                                <?php if ($canEdit): ?>
+                                <?php if ($canEdit && $isEditMode): ?>
                                 <form action="?route=manage_lists" method="POST" style="display:flex; gap:2px; margin:0; width:100%;">
                                     <input type="hidden" name="sub_action" value="update_comment"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
                                     <input type="text" name="comment" value="<?= htmlspecialchars($targetList['comments'][$itId] ?? '') ?>" style="margin:0; font-size:10px; padding:1px 3px;">
                                     <input type="submit" value="Save" style="padding:1px 4px; font-size:10px;" <?= $isBanned ? 'disabled' : '' ?>>
                                 </form>
-                                <?php else: echo htmlspecialchars($targetList['comments'][$itId] ?? 'No metadata descriptors applied.'); endif; ?>
+                                <?php else: 
+                                    $commentText = $targetList['comments'][$itId] ?? '';
+                                    echo htmlspecialchars($commentText !== '' ? $commentText : 'No metadata descriptors applied.'); 
+                                endif; ?>
                             </td>
-                            <?php if ($canEdit): ?>
+                            <?php if ($canEdit && $isEditMode): ?>
                             <td>
                                 <form action="?route=manage_lists" method="POST" style="display:inline;">
                                     <input type="hidden" name="sub_action" value="rearrange_item"><input type="hidden" name="list_name" value="<?= htmlspecialchars($tgtListName) ?>"><input type="hidden" name="item_id" value="<?= $itId ?>"><input type="hidden" name="target_user" value="<?= htmlspecialchars($_GET['user_id']) ?>">
