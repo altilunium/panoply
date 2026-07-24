@@ -1,8 +1,8 @@
 <?php
 date_default_timezone_set('Asia/Jakarta');
 define('DB_DIR', __DIR__ . '/wikidata_local_db');
-define('SUPERUSER_ID', 'SET UP YOURS');
-define('WRITEUNLOCK_KEY', 'SET UP YOURS');
+define('SUPERUSER_ID', 'SETUP YOURS!');
+define('WRITEUNLOCK_KEY', 'SETUP YOURS!');
 $app_key = 'your-super-secret-app-wide-key!'; 
 $cipher = 'AES-256-CBC';
 $iv = substr(hash('sha256', 'static-iv-for-single-file-prototype'), 0, 16);
@@ -113,6 +113,20 @@ if (isset($_GET['api'])) {
             $output[] = ['id' => $id, 'label' => $meta['label']];
         }
         echo json_encode($output);
+        exit;
+    }
+
+    if ($apiAction === 'load_properties') {
+        $offset = intval($_GET['offset'] ?? 0);
+        $limit = 15;
+        $props = [];
+        foreach ($index['properties'] as $pid => $pData) {
+            if (empty($pData['deleted'])) {
+                $props[] = ['id' => $pid, 'label' => $pData['label']];
+            }
+        }
+        $slice = array_slice($props, $offset, $limit);
+        echo json_encode($slice);
         exit;
     }
 
@@ -322,9 +336,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
         }
     }
 
-    if ($route === 'add_statement') {
+    if ($route === 'add_statement' || $route === 'edit_statement') {
         if (!$canWrite) {
-            $msg = "Error: Read-write privilege required to append statements.";
+            $msg = "Error: Read-write privilege required to modify statements.";
         } else {
             $itemId = $_POST['item_id'] ?? '';
             $pId = $_POST['property_id'] ?? '';
@@ -361,29 +375,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
             
             $item = db_get_item($itemId);
             if ($item && isset($index['properties'][$pId]) && !$index['properties'][$pId]['deleted']) {
-                $item['statements'][] = ['p_id' => $pId, 'value' => $val];
+                if ($route === 'edit_statement') {
+                    $indexPos = intval($_POST['index'] ?? -1);
+                    if ($indexPos >= 0 && isset($item['statements'][$indexPos])) {
+                        $oldVal = $item['statements'][$indexPos]['value'];
+                        if (strpos($oldVal, ':') === 0) {
+                            $oldTargetId = substr($oldVal, 1);
+                            if (isset($index['backlinks'][$oldTargetId])) {
+                                $index['backlinks'][$oldTargetId] = array_diff($index['backlinks'][$oldTargetId], [$itemId]);
+                                if (empty($index['backlinks'][$oldTargetId])) unset($index['backlinks'][$oldTargetId]);
+                            }
+                        }
+                        $item['statements'][$indexPos] = ['p_id' => $pId, 'value' => $val];
+                        log_activity($currentUserId, 'edit_statement', "Edited claim position $indexPos in Q$itemId");
+                    }
+                } else {
+                    $item['statements'][] = ['p_id' => $pId, 'value' => $val];
+                    log_activity($currentUserId, 'add_statement', "Added claim to Q$itemId");
+                }
+                
                 db_save_item($itemId, $item);
                 
                 if (strpos($val, ':') === 0) {
                     $targetId = substr($val, 1);
                     $index['backlinks'][$targetId][] = $itemId;
                     $index['backlinks'][$targetId] = array_unique($index['backlinks'][$targetId]);
-                    db_save_json('index.json', $index);
                 }
-
-                $propStringName = $index['properties'][$pId]['label'] ?? $pId;
-                $resolvedValueDetails = $val;
-                if (strpos($val, ':') === 0) {
-                    $resolvingTargetId = substr($val, 1);
-                    $resolvingItemObj = db_get_item($resolvingTargetId);
-                    $resolvedValueDetails = ($resolvingItemObj['label'] ?? "Unknown Entity") . " (Q" . $resolvingTargetId . ")";
-                } elseif (strpos($val, ';') === 0) {
-                    $parts = explode('|', substr($val, 1));
-                    $resolvedValueDetails = ($parts[1] ?? $parts[0]) . " (" . $parts[0] . ") [Wikidata]";
-                }
-                log_activity($currentUserId, 'add_statement', "Added claim to Q$itemId: $propStringName ($pId) -> $resolvedValueDetails");
+                db_save_json('index.json', $index);
                 
-                header("Location: ?id=" . $itemId);
+                header("Location: ?id=" . $itemId . ($route === 'edit_statement' ? "&show_matrix=1" : ""));
                 exit;
             }
         }
@@ -400,6 +420,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isBanned) {
                 $deletedStmt = $item['statements'][$indexPos];
                 array_splice($item['statements'], $indexPos, 1);
                 db_save_item($itemId, $item);
+                
+                if (strpos($deletedStmt['value'], ':') === 0) {
+                    $oldTargetId = substr($deletedStmt['value'], 1);
+                    if (isset($index['backlinks'][$oldTargetId])) {
+                        $index['backlinks'][$oldTargetId] = array_diff($index['backlinks'][$oldTargetId], [$itemId]);
+                        if (empty($index['backlinks'][$oldTargetId])) {
+                            unset($index['backlinks'][$oldTargetId]);
+                        }
+                        db_save_json('index.json', $index);
+                    }
+                }
+                
                 log_activity($currentUserId, 'delete_statement', "Removed statement entry position $indexPos from Q$itemId");
                 header("Location: ?id=" . $itemId . "&show_matrix=1");
                 exit;
@@ -607,7 +639,7 @@ function render_value($val) {
     if (filter_var($val, FILTER_VALIDATE_URL)) {
         return "<a href='" . htmlspecialchars($val) . "' target='_blank'>" . htmlspecialchars($val) . " ↗</a>";
     }
-    return htmlspecialchars($val);
+    return nl2br(htmlspecialchars($val));
 }
 ?>
 <!DOCTYPE html>
@@ -720,23 +752,17 @@ function render_value($val) {
             </div>
             <div class="col">
                 <h2>Active Semantic Declarations Matrix</h2>
-                <table>
-                    <tr><th>PID Pointers</th><th>Property Label Specification</th><th>Management Policy</th></tr>
-                    <?php foreach ($index['properties'] as $pid => $pData): if (!empty($pData['deleted'])) continue; ?>
-                        <tr>
-                            <td><?= $pid ?></td>
-                            <td><?= htmlspecialchars($pData['label']) ?></td>
-                            <td>
-                                <?php if ($currentUserId === SUPERUSER_ID): ?>
-                                    <form action="?route=delete_property" method="POST" style="display:inline;">
-                                        <input type="hidden" name="property_id" value="<?= $pid ?>">
-                                        <input type="submit" class="action-btn" value="[Purge Structural Node]" onclick="return confirm('Purge property schema?');">
-                                    </form>
-                                <?php else: echo "<span style='color:#aaa;'>Immutable</span>"; endif; ?>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
+                <div style="display:flex; gap:4px; margin-bottom:8px; position:relative;">
+                    <input type="text" class="autocomplete-trigger" data-type="prop" placeholder="Search exact property identity ledger..." autocomplete="off" id="prop-search-input">
+                    <div class="ac-dropdown" style="top:100%;"></div>
+                </div>
+                <table id="properties-stream-table">
+                    <thead><tr><th>PID Pointers</th><th>Property Label Specification</th><th>Management Policy</th></tr></thead>
+                    <tbody id="properties-stream-body"></tbody>
                 </table>
+                <div style="text-align: center; margin-top: 4px;">
+                    <button id="load-more-props-btn" onclick="fetchNextPropertyBatch()">Download Next Segment Layer ↓</button>
+                </div>
             </div>
         </div>
 
@@ -756,10 +782,10 @@ function render_value($val) {
             <div style="background:#f1f2f3; padding:4px; margin-bottom:4px; border:1px solid #d1d5da; display:flex; justify-content:space-between; align-items:center;">
                 <form action="?route=edit_item_label" method="POST" style="display:flex; align-items:center; gap:4px; margin:0; flex:1; flex-wrap:wrap">
                     <input type="hidden" name="item_id" value="<?= $viewId ?>">
-                    <strong>Entity Q<?= $viewId ?> Node Identity: </strong>
+                    <strong>Q<?= $viewId ?></strong>
                     <input type="text" name="new_label" value="<?= htmlspecialchars($item['label']) ?>" style="margin:0; flex:1; font-weight:bold;field-sizing:content;">
-                    <input type="submit" value="Apply Identity Correction" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
-                    <button type="button" style="margin-left:4px; background:#6a737d;" onclick="toggleMatrixColumns()">modify order-action matrix</button>
+                    <input type="submit" value="▷" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
+                    <button type="button" style="margin-left:4px; background:#6a737d;" onclick="toggleMatrixColumns()">🛆</button>
                 </form>
                 <?php if ($currentUserId === SUPERUSER_ID): ?>
                     <form action="?route=admin_delete_item" method="POST" style="margin-left:8px;" onsubmit="return confirm('Completely eradicate this item entity node from the global ledger?');">
@@ -777,8 +803,8 @@ function render_value($val) {
             <table id="statements-matrix-table">
                 <thead>
                     <tr>
-                        <th style="width:1%;">Declared Semantic Link Property</th>
-                        <th>Parsed Value Definition Claims</th>
+                        <th style="width:1%;">Property</th>
+                        <th>Value</th>
                         <th class="matrix-col" style="width: 40px; text-align: center;">Order</th>
                         <th class="matrix-col">Action Matrix</th>
                     </tr>
@@ -807,17 +833,65 @@ function render_value($val) {
                         </td>
                         <?php endif; ?>
                         
-                        <td style="background: #fff;"><?= render_value($stmt['value']) ?></td>
+                        <td style="background: #fff; cursor: pointer;" class="copyable-value" data-raw-value="<?= htmlspecialchars($stmt['value']) ?>" onclick="copyStatementValue(event, this)"><?= render_value($stmt['value']) ?></td>
                         
                         <td class="matrix-col" style="text-align:center; cursor: <?= $canWrite ? 'grab' : 'not-allowed' ?>; font-size:16px; color:#aaa; user-select: none;" title="<?= $canWrite ? 'Drag to reorder' : 'Reorder disabled (readonly)' ?>">
                             ☰
                         </td>
                         
                         <td class="matrix-col">
+                            <button type="button" class="action-btn" onclick="toggleEditStatement(<?= $idx ?>)">[Edit Statement]</button>
                             <form action="?route=delete_statement" method="POST" style="display:inline;">
                                 <input type="hidden" name="item_id" value="<?= $viewId ?>">
                                 <input type="hidden" name="index" value="<?= $idx ?>">
                                 <input type="submit" class="action-btn" value="[Delete Assignment]" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?> onclick="return confirm('Log statement extraction?');">
+                            </form>
+                        </td>
+                    </tr>
+                    <tr id="edit-stmt-row-<?= $idx ?>" class="matrix-col" style="display:none; background:#fafbfc;">
+                        <td colspan="4" style="padding:6px; border:1px solid #0366d6;">
+                            <form action="?route=edit_statement" method="POST" style="display:flex; flex-direction:column; gap:2px;">
+                                <input type="hidden" name="item_id" value="<?= $viewId ?>">
+                                <input type="hidden" name="index" value="<?= $idx ?>">
+                                
+                                <div style="position:relative;">
+                                    <label>Modify Property Schema:</label>
+                                    <input type="text" class="autocomplete-trigger" data-type="prop" value="<?= htmlspecialchars($propLabel) ?> (<?= htmlspecialchars($pId) ?>)" required autocomplete="off">
+                                    <input type="hidden" name="property_id" class="autocomplete-target" value="<?= htmlspecialchars($pId) ?>">
+                                    <div class="ac-dropdown"></div>
+                                </div>
+
+                                <div style="margin:4px 0; border:1px dashed #ccc; padding:4px; background:#fff;">
+                                    <label><input type="radio" name="value_mode" value="text" checked onchange="toggleEditInputs(this, <?= $idx ?>)"> Free String / Remote Web URL Data Payload</label>
+                                    <label style="margin-left:8px;"><input type="radio" name="value_mode" value="link_internal" onchange="toggleEditInputs(this, <?= $idx ?>)"> Link Node To Internal Database Entity</label>
+                                    <label style="margin-left:8px;"><input type="radio" name="value_mode" value="link_wikidata" onchange="toggleEditInputs(this, <?= $idx ?>)"> Link Node To Wikidata Items</label>
+                                </div>
+
+                                <div id="edit-wrapper-text-<?= $idx ?>">
+                                    <textarea name="value" rows="2" placeholder="Enter alphanumeric text statement or external hyperlink structure..."><?= htmlspecialchars($stmt['value']) ?></textarea>
+                                </div>
+
+                                <div id="edit-wrapper-link-<?= $idx ?>" style="display:none; position:relative;">
+                                    <input type="text" class="autocomplete-trigger" data-type="item" placeholder="Search item nodes database by name mapping..." autocomplete="off">
+                                    <input type="hidden" name="internal_item_id" class="autocomplete-target">
+                                    <div class="ac-dropdown"></div>
+                                </div>
+
+                                <div id="edit-wrapper-wikidata-<?= $idx ?>" style="display:none; position:relative;">
+                                    <input type="text" class="autocomplete-trigger" data-type="wikidata" placeholder="Type to search live remote Wikidata entities (e.g., Douglas Adams)..." autocomplete="off">
+                                    <input type="hidden" name="wikidata_id" class="autocomplete-target">
+                                    <input type="hidden" name="wikidata_label" class="autocomplete-extra-target">
+                                    <div class="ac-dropdown"></div>
+                                    <label style="display:block; margin-top:6px; font-size:11px;">
+                                        <input type="checkbox" name="create_shadow" value="1" checked>
+                                        Instantiate Local Shadow Entity Node (Uncheck to append as a simple external wdlite link)
+                                    </label>
+                                </div>
+
+                                <div style="margin-top:4px;">
+                                    <input type="submit" value="Save Modifications" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
+                                    <button type="button" onclick="toggleEditStatement(<?= $idx ?>)" style="background:#6a737d;">Cancel</button>
+                                </div>
                             </form>
                         </td>
                     </tr>
@@ -883,7 +957,7 @@ function render_value($val) {
                         </div>
 
                         <div id="wrapper-value-text">
-                            <input type="text" name="value" placeholder="Enter alphanumeric text statement or external hyperlink structure...">
+                            <textarea name="value" rows="2" placeholder="Enter alphanumeric text statement or external hyperlink structure..."></textarea>
                         </div>
 
                         <div id="wrapper-value-link" style="display:none; position:relative;">
@@ -1294,6 +1368,29 @@ function fetchNextStreamBatch() {
         });
 }
 
+let propOffsetPosition = 0;
+function fetchNextPropertyBatch() {
+    const tableBody = document.getElementById('properties-stream-body');
+    if (!tableBody) return;
+    
+    fetch('?api=load_properties&offset=' + propOffsetPosition)
+        .then(response => response.json())
+        .then(data => {
+            if (data.length === 0) {
+                document.getElementById('load-more-props-btn').innerText = "End of Semantic Properties Matrix";
+                document.getElementById('load-more-props-btn').disabled = true;
+                return;
+            }
+            data.forEach(prop => {
+                const row = document.createElement('tr');
+let deleteAction = `<?= ($currentUserId === SUPERUSER_ID) ? '<form action="?route=delete_property" method="POST" style="display:inline;"><input type="hidden" name="property_id" value="' : "" ?>${prop.id}<?= ($currentUserId === SUPERUSER_ID) ? '"><input type="submit" class="action-btn" value="[Purge Structural Node]" onclick="return confirm(\'Purge property schema?\');"></form>' : '<span style="color:#aaa;">Immutable</span>' ?>`;
+row.innerHTML = '<td>' + prop.id + '</td><td>' + escapeHtml(prop.label) + '</td><td>' + deleteAction + '</td>';
+                tableBody.appendChild(row);
+            });
+            propOffsetPosition += data.length;
+        });
+}
+
 let logOffsetPosition = 0;
 function fetchNextLogBatch() {
     const logContainer = document.getElementById('admin-logs-stream');
@@ -1327,13 +1424,39 @@ function toggleValueInputs(radioNode) {
     document.getElementById('wrapper-value-wikidata').style.display = radioNode.value === 'link_wikidata' ? 'block' : 'none';
 }
 
+function toggleEditInputs(radioNode, idx) {
+    document.getElementById('edit-wrapper-text-' + idx).style.display = radioNode.value === 'text' ? 'block' : 'none';
+    document.getElementById('edit-wrapper-link-' + idx).style.display = radioNode.value === 'link_internal' ? 'block' : 'none';
+    document.getElementById('edit-wrapper-wikidata-' + idx).style.display = radioNode.value === 'link_wikidata' ? 'block' : 'none';
+}
+
+function toggleEditStatement(idx) {
+    const editRow = document.getElementById('edit-stmt-row-' + idx);
+    if (editRow) {
+        editRow.style.display = editRow.style.display === 'none' ? 'table-row' : 'none';
+    }
+}
+
+function copyStatementValue(e, cell) {
+    if (document.body.classList.contains('matrix-editing')) return;
+    if (e.target.tagName.toLowerCase() === 'a') return;
+    const rawVal = cell.getAttribute('data-raw-value');
+    if (rawVal) {
+        navigator.clipboard.writeText(rawVal);
+        const origBg = cell.style.background;
+        cell.style.background = '#d4edda';
+        setTimeout(() => { cell.style.background = origBg; }, 400);
+    }
+}
+
 function toggleMatrixColumns() {
+    document.body.classList.toggle('matrix-editing');
     const columns = document.querySelectorAll('.matrix-col');
     columns.forEach(col => {
-        if (col.style.display === 'table-cell' || col.style.display === 'block') {
+        if (col.style.display === 'table-cell' || col.style.display === 'block' || col.style.display === 'table-row') {
             col.style.display = 'none';
         } else {
-            col.style.display = 'table-cell';
+            col.style.display = col.tagName.toLowerCase() === 'tr' ? 'none' : 'table-cell';
         }
     });
 }
@@ -1341,6 +1464,9 @@ function toggleMatrixColumns() {
 document.addEventListener("DOMContentLoaded", function() {
     if (document.getElementById('items-stream-body')) {
         fetchNextStreamBatch();
+    }
+    if (document.getElementById('properties-stream-body')) {
+        fetchNextPropertyBatch();
     }
     if (document.getElementById('admin-logs-stream')) {
         fetchNextLogBatch();
@@ -1399,10 +1525,8 @@ document.addEventListener("DOMContentLoaded", function() {
                             optionRow.innerHTML = optionHTML;
                             optionRow.addEventListener('click', function() {
                                 inputField.value = match.label + ' (' + suffixId + ')';
-                                targetStore.value = match.id;
-                                if (extraStore) {
-                                    extraStore.value = match.label;
-                                }
+                                if (targetStore) targetStore.value = match.id;
+                                if (extraStore) extraStore.value = match.label;
                                 dropBox.style.display = 'none';
                             });
                             dropBox.appendChild(optionRow);
