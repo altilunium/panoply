@@ -1,8 +1,8 @@
 <?php
 date_default_timezone_set('Asia/Jakarta');
 define('DB_DIR', __DIR__ . '/wikidata_local_db');
-define('SUPERUSER_ID', 'SETUP YOURS!');
-define('WRITEUNLOCK_KEY', 'SETUP YOURS!');
+define('SUPERUSER_ID', 'SETUP YOURS');
+define('WRITEUNLOCK_KEY', 'SETUP YOURS');
 $app_key = 'your-super-secret-app-wide-key!'; 
 $cipher = 'AES-256-CBC';
 $iv = substr(hash('sha256', 'static-iv-for-single-file-prototype'), 0, 16);
@@ -801,6 +801,7 @@ function render_value($val) {
             </form>
 
             <table id="statements-matrix-table">
+                <!--
                 <thead>
                     <tr>
                         <th style="width:1%;">Property</th>
@@ -809,6 +810,7 @@ function render_value($val) {
                         <th class="matrix-col">Action Matrix</th>
                     </tr>
                 </thead>
+                !-->
                 <?php if (empty($item['statements'])): ?>
                 <tbody>
                     <tr><td colspan="4" style="color:#aaa; text-align:center;">No relational matrix links map out from this entity block.</td></tr>
@@ -828,7 +830,7 @@ function render_value($val) {
                     <?php foreach ($stmts as $i => $s): $idx = $s['idx']; $stmt = $s['stmt']; ?>
                     <tr class="draggable-row" <?= $canWrite ? 'draggable="true"' : '' ?> data-idx="<?= $idx ?>">
                         <?php if ($i === 0): ?>
-                        <td rowspan="<?= $rowspan ?>" style="background: #fff; vertical-align: middle;">
+                        <td rowspan="<?= $rowspan ?>" style="background: #fff; vertical-align: middle; width:1%">
                             <strong><?= htmlspecialchars($propLabel) ?></strong> <span class="badge"><?= htmlspecialchars($pId) ?></span>
                         </td>
                         <?php endif; ?>
@@ -937,9 +939,9 @@ function render_value($val) {
                 ?>
             </div>
             
-            <div class="col" style="margin-top:12px; background:#fafbfc; border-top:2px solid #ccc;">
-                <details>
-                    <summary style="cursor:pointer; font-weight:bold; font-size:12px; padding:4px;">[+] Append Structural Relational Statement Protocol</summary>
+            <div class="footer-section" >
+                
+                    <h2>Append Structural Relational Statement Protocol</h2>
                     <form action="?route=add_statement" method="POST" style="display:flex; flex-direction:column; gap:2px; margin-top:6px;">
                         <input type="hidden" name="item_id" value="<?= $viewId ?>">
                         
@@ -979,7 +981,7 @@ function render_value($val) {
 
                         <input type="submit" value="Commit Statement Framework" style="margin-top:4px;" <?= ($isBanned || !$canWrite) ? 'disabled' : '' ?>>
                     </form>
-                </details>
+                
             </div>
 
         <?php endif; ?>
